@@ -15,6 +15,8 @@ from .checkpoint import atomic_torch_save
 from .environment import LAYOUTS, SPAWNS, TankSelfPlayEnv
 from .model import TankActorCritic
 from .observation import BULLET_FEATURES, MAP_CHANNELS, MAP_SIZE, MAX_BULLETS, MAX_OTHER_TANKS, Observation, SELF_FEATURES, TANK_FEATURES
+from .live_plot import try_create_plot
+from .opponents import OPPONENT_CHOICES, OpponentController, load_opponent_model
 
 def parse_args() -> argparse.Namespace:
     """第三关：随机迷宫。"""
@@ -41,9 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--output", type=Path, default=Path("checkpoints/combat_stage3_maze"), help="输出目录；断点续训时默认沿用模型所在目录")
     parser.add_argument("--save-every", type=int, default=10, help="每多少次更新额外保存一个模型")
+    parser.add_argument("--opponent", choices=OPPONENT_CHOICES, default="self", help="self 为镜像自博弈；其余为脚本或冻结模型对手")
+    parser.add_argument("--opponent-model", type=Path, default=None, help="--opponent model 时使用的冻结权重")
     loading = parser.add_mutually_exclusive_group()
     loading.add_argument("--resume", type=Path, default=None, help="恢复模型、优化器和累计步数，继续同一训练阶段")
     loading.add_argument("--initialize-from", type=Path, default=None, help="只继承模型权重，并从0开始新的训练阶段")
+    parser.add_argument("--no-plot", action="store_true", help="不弹出实时折线图窗口")
     return parser.parse_args()
 
 
@@ -126,6 +131,23 @@ def train(args: argparse.Namespace) -> Path:
             raise SystemExit("初始化模型结构与当前集合编码器不兼容，需要重新训练。") from error
         print(f"initialized model weights from={args.initialize_from}")
 
+    if args.opponent == "model":
+        if args.opponent_model is None:
+            raise SystemExit("--opponent model 需要同时提供 --opponent-model")
+        opponent: OpponentController | None = OpponentController(
+            "model",
+            load_opponent_model(args.opponent_model, device),
+            device,
+            seed=args.seed + 97,
+        )
+        print(f"opponent=frozen model path={args.opponent_model}")
+    elif args.opponent == "self":
+        opponent = None
+        print("opponent=self (shared policy)")
+    else:
+        opponent = OpponentController(args.opponent, seed=args.seed + 97)
+        print(f"opponent={args.opponent}")
+
     environments = [
         TankSelfPlayEnv(
             action_repeat=args.action_repeat,
@@ -138,8 +160,14 @@ def train(args: argparse.Namespace) -> Path:
         for _ in range(args.num_envs)
     ]
     current_observations = [env.reset(seed=args.seed + index) for index, env in enumerate(environments)]
+    learner_index = np.zeros(args.num_envs, dtype=np.int64)
+    if opponent is not None:
+        for env_index in range(args.num_envs):
+            learner_index[env_index] = np.random.randint(0, TankSelfPlayEnv.num_agents)
+            opponent.reset_env(env_index)
 
-    agents_per_batch = args.num_envs * TankSelfPlayEnv.num_agents
+    learners_per_env = TankSelfPlayEnv.num_agents if opponent is None else 1
+    agents_per_batch = args.num_envs * learners_per_env
     batch_size = args.rollout_steps * agents_per_batch
     minibatch_size = min(args.minibatch_size, batch_size)
     remaining_steps = max(0, args.total_steps - global_step)
@@ -147,6 +175,7 @@ def train(args: argparse.Namespace) -> Path:
     episode_returns = np.zeros((args.num_envs, TankSelfPlayEnv.num_agents), dtype=np.float32)
     recent_returns: deque[float] = deque(maxlen=100)
     recent_results: deque[int] = deque(maxlen=100)  # 1 为分出胜负，0 为平局。
+    recent_learner_wins: deque[int] = deque(maxlen=100)
     args.output.mkdir(parents=True, exist_ok=True)
     log_path = args.output / "training_log.csv"
     start_time = time.perf_counter()
@@ -157,11 +186,15 @@ def train(args: argparse.Namespace) -> Path:
         print(f"target total steps already reached: {global_step} >= {args.total_steps}")
         return args.output / "latest.pt"
 
+    plot = None if args.no_plot else try_create_plot()
+    if plot is not None and args.resume is not None:
+        plot.load_csv(log_path)
+
     append_log = args.resume is not None and log_path.exists()
     with log_path.open("a" if append_log else "w", newline="", encoding="utf-8") as log_file:
         writer = csv.writer(log_file)
         if not append_log:
-            writer.writerow(("update", "global_step", "mean_return_100", "decisive_rate_100", "policy_loss", "value_loss", "entropy", "fire_action_rate", "steps_per_second"))
+            writer.writerow(("update", "global_step", "mean_return_100", "decisive_rate_100", "learner_win_100", "policy_loss", "value_loss", "entropy", "fire_action_rate", "steps_per_second"))
 
         for update in range(1, updates + 1):
             rollout = {
@@ -179,36 +212,75 @@ def train(args: argparse.Namespace) -> Path:
             dones = np.empty((args.rollout_steps, agents_per_batch), dtype=np.float32)
 
             for rollout_step in range(args.rollout_steps):
-                flat_observations = [observation for pair in current_observations for observation in pair]
-                step_batch = stack_observations(flat_observations)
+                if opponent is None:
+                    learner_observations = [observation for pair in current_observations for observation in pair]
+                else:
+                    learner_observations = [
+                        current_observations[env_index][int(learner_index[env_index])]
+                        for env_index in range(args.num_envs)
+                    ]
+                step_batch = stack_observations(learner_observations)
                 for key, array in step_batch.items():
                     rollout[key][rollout_step] = array
                 with torch.no_grad():
                     action_tensor, log_prob_tensor, _, value_tensor = model.get_action_and_value(*_model_batch(step_batch, device))
-                action_batch = action_tensor.cpu().numpy()
-                actions[rollout_step] = action_batch
+                learner_actions = action_tensor.cpu().numpy()
+                actions[rollout_step] = learner_actions
                 log_probs[rollout_step] = log_prob_tensor.cpu().numpy()
                 values[rollout_step] = value_tensor.cpu().numpy()
 
                 next_observations: list[list[Observation]] = []
                 for env_index, env in enumerate(environments):
-                    begin = env_index * TankSelfPlayEnv.num_agents
-                    end = begin + TankSelfPlayEnv.num_agents
-                    observations, env_rewards, done, info = env.step(action_batch[begin:end])
-                    rewards[rollout_step, begin:end] = env_rewards
-                    dones[rollout_step, begin:end] = float(done)
+                    if opponent is None:
+                        begin = env_index * TankSelfPlayEnv.num_agents
+                        end = begin + TankSelfPlayEnv.num_agents
+                        joint_actions = learner_actions[begin:end]
+                        slot = None
+                    else:
+                        slot = int(learner_index[env_index])
+                        other = 1 - slot
+                        joint_actions = np.zeros((TankSelfPlayEnv.num_agents, 3), dtype=np.int64)
+                        joint_actions[slot] = learner_actions[env_index]
+                        joint_actions[other] = opponent.action(
+                            env_index,
+                            env.game,
+                            env.agent_ids[other],
+                            current_observations[env_index][other],
+                        )
+                    observations, env_rewards, done, info = env.step(joint_actions)
+                    if opponent is None:
+                        begin = env_index * TankSelfPlayEnv.num_agents
+                        end = begin + TankSelfPlayEnv.num_agents
+                        rewards[rollout_step, begin:end] = env_rewards
+                        dones[rollout_step, begin:end] = float(done)
+                    else:
+                        rewards[rollout_step, env_index] = env_rewards[slot]
+                        dones[rollout_step, env_index] = float(done)
                     episode_returns[env_index] += env_rewards
                     if done:
-                        recent_returns.extend(float(value) for value in episode_returns[env_index])
+                        if opponent is None:
+                            recent_returns.extend(float(value) for value in episode_returns[env_index])
+                        else:
+                            recent_returns.append(float(episode_returns[env_index, slot]))
+                            recent_learner_wins.append(int(info["winner"] == env.agent_ids[slot]))
                         recent_results.append(int(info["winner"] is not None))
                         episode_returns[env_index].fill(0.0)
                         observations = env.reset()
+                        if opponent is not None:
+                            learner_index[env_index] = np.random.randint(0, TankSelfPlayEnv.num_agents)
+                            opponent.reset_env(env_index)
                     next_observations.append(observations)
                 current_observations = next_observations
                 global_step += agents_per_batch
                 run_steps += agents_per_batch
 
-            flat_next = [observation for pair in current_observations for observation in pair]
+            if opponent is None:
+                flat_next = [observation for pair in current_observations for observation in pair]
+            else:
+                flat_next = [
+                    current_observations[env_index][int(learner_index[env_index])]
+                    for env_index in range(args.num_envs)
+                ]
             with torch.no_grad():
                 _, _, _, next_values_tensor = model.get_action_and_value(
                     *_model_batch(stack_observations(flat_next), device),
@@ -261,20 +333,25 @@ def train(args: argparse.Namespace) -> Path:
             elapsed = max(time.perf_counter() - start_time, 1e-6)
             mean_return = float(np.mean(recent_returns)) if recent_returns else float("nan")
             decisive_rate = float(np.mean(recent_results)) if recent_results else float("nan")
+            learner_win = float(np.mean(recent_learner_wins)) if recent_learner_wins else float("nan")
             fire_action_rate = float((flat_actions[:, 2] == 1).mean())
             steps_per_second = int(run_steps / elapsed)
             print(
                 f"update={update}/{updates} step={global_step} return100={mean_return:.3f} "
-                f"decisive100={decisive_rate:.2f} policy={mean_metrics[0]:.4f} "
+                f"decisive100={decisive_rate:.2f} win100={learner_win:.2f} policy={mean_metrics[0]:.4f} "
                 f"value={mean_metrics[1]:.4f} entropy={mean_metrics[2]:.4f} "
                 f"fire_rate={fire_action_rate:.3f} sps={steps_per_second}"
             )
-            writer.writerow((update, global_step, mean_return, decisive_rate, *mean_metrics, fire_action_rate, steps_per_second))
+            writer.writerow((update, global_step, mean_return, decisive_rate, learner_win, *mean_metrics, fire_action_rate, steps_per_second))
             log_file.flush()
+            if plot is not None:
+                plot.update(global_step, mean_return, learner_win, float(mean_metrics[2]))
             save_checkpoint(args.output / "latest.pt", model, optimizer, args, global_step)
             if args.save_every > 0 and update % args.save_every == 0:
                 save_checkpoint(args.output / f"step_{global_step}.pt", model, optimizer, args, global_step)
 
+    if plot is not None:
+        plot.close()
     return args.output / "latest.pt"
 
 

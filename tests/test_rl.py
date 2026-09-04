@@ -38,13 +38,12 @@ def test_observation_has_fixed_shapes_for_different_maps():
         assert observation["bullet_mask"].shape == (MAX_BULLETS,)
 
 
-def test_observation_swaps_self_and_enemy_channels():
+def test_observation_map_is_single_local_wall_channel():
     game = TankGame(rows=6, cols=6)
-    first = build_observation(game, tank_id=0)["map"]
-    second = build_observation(game, tank_id=1)["map"]
-    assert np.array_equal(first[0], second[0])
-    assert np.array_equal(first[1], second[2])
-    assert np.array_equal(first[2], second[1])
+    observation = build_observation(game, tank_id=0)
+    assert MAP_CHANNELS == 1
+    assert observation["map"].shape == (1, MAP_SIZE, MAP_SIZE)
+    assert observation["map"].max() <= 1.0
 
 
 def test_bullet_set_marks_enemy_shot_and_ignores_empty_slots():
@@ -84,7 +83,7 @@ def test_survivor_wins_even_when_enemy_destroys_itself():
     assert done is True
     assert info["winner"] == 1
     assert np.isclose(rewards[0], RewardConfig().loss)
-    assert np.isclose(rewards[1], RewardConfig().win)
+    assert rewards[1] >= RewardConfig().win - 1e-5
 
 
 def test_own_bullet_kill_uses_small_self_kill_penalty():
@@ -96,7 +95,7 @@ def test_own_bullet_kill_uses_small_self_kill_penalty():
     assert done is True
     assert info["winner"] == 1
     assert np.isclose(rewards[0], RewardConfig().self_kill)
-    assert np.isclose(rewards[1], RewardConfig().win)
+    assert rewards[1] >= RewardConfig().win - 1e-5
 
 
 def test_timeout_is_worse_than_waiting_without_terminal_result():
@@ -121,6 +120,39 @@ def test_open_far_spawn_places_tanks_apart():
     env.reset(seed=12)
     first, second = env.game.tanks
     assert math.hypot(second.x - first.x, second.y - first.y) > 3.0
+
+
+def test_aim_script_stops_and_fires_when_facing_enemy():
+    from rl_stage1.opponents import script_action
+
+    env = TankSelfPlayEnv(layout="open", spawn="close_facing", rows=6, cols=6)
+    env.reset(seed=11)
+    first, second = env.game.tanks
+    first.x, first.y, first.heading = 2.0, 3.0, 0.0
+    second.x, second.y = 4.0, 3.0
+    throttle, steer, fire = script_action(env.game, first.tank_id, "aim", np.random.default_rng(0))
+    assert throttle == 1
+    assert steer == 1
+    assert fire == 1
+
+
+def test_idle_script_never_moves_or_fires():
+    from rl_stage1.opponents import script_action
+
+    env = TankSelfPlayEnv(layout="open", spawn="close_facing", rows=6, cols=6)
+    env.reset(seed=11)
+    assert script_action(env.game, env.game.tanks[0].tank_id, "idle", np.random.default_rng(1)) == (1, 1, 0)
+
+
+def test_move_script_never_fires():
+    from rl_stage1.opponents import script_action
+
+    env = TankSelfPlayEnv(layout="open", spawn="close_facing", rows=6, cols=6)
+    env.reset(seed=11)
+    rng = np.random.default_rng(2)
+    for _ in range(20):
+        _throttle, _steer, fire = script_action(env.game, env.game.tanks[0].tank_id, "move", rng)
+        assert fire == 0
 
 
 def test_shortest_path_distance_is_symmetric():

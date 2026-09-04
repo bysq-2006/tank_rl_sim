@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from .environment import TankSelfPlayEnv
 from .model import TankActorCritic
+from .opponents import OPPONENT_CHOICES, OpponentController, load_opponent_model
 from .train import _model_batch, stack_observations
 
 
@@ -24,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--stochastic", action="store_true", help="按概率采样动作，而不是总选概率最高动作")
     parser.add_argument("--no-render", action="store_true", help="关闭 Pygame 窗口并只输出统计")
+    parser.add_argument("--opponent", choices=OPPONENT_CHOICES, default="self", help="评估时的对手；self 为镜像对打")
+    parser.add_argument("--opponent-model", type=Path, default=None, help="--opponent model 时的冻结权重")
     return parser.parse_args()
 
 
@@ -46,6 +50,19 @@ def evaluate(args: argparse.Namespace) -> dict[str, int]:
     except RuntimeError as error:
         raise SystemExit("模型结构与当前集合编码器不兼容，需要用新观察重新训练。") from error
     model.eval()
+    if args.opponent == "model":
+        if args.opponent_model is None:
+            raise SystemExit("--opponent model 需要同时提供 --opponent-model")
+        opponent: OpponentController | None = OpponentController(
+            "model",
+            load_opponent_model(args.opponent_model, device),
+            device,
+            seed=args.seed + 3,
+        )
+    elif args.opponent == "self":
+        opponent = None
+    else:
+        opponent = OpponentController(args.opponent, seed=args.seed + 3)
     config = checkpoint.get("config", {})
     action_repeat = int(config.get("action_repeat", 2))
     env = TankSelfPlayEnv(
@@ -66,15 +83,30 @@ def evaluate(args: argparse.Namespace) -> dict[str, int]:
     try:
         for game_index in range(args.games):
             observations = env.reset(seed=args.seed + game_index)
+            learner_slot = 0
+            if opponent is not None:
+                opponent.reset_env(0)
             done = False
             info: dict[str, object] = {"winner": None}
             while not done:
-                with torch.no_grad():
-                    actions, _, _, _ = model.get_action_and_value(
-                        *_model_batch(stack_observations(observations), device),
-                        deterministic=not args.stochastic,
-                    )
-                observations, _, done, info = env.step(actions.cpu().numpy())
+                if opponent is None:
+                    with torch.no_grad():
+                        actions, _, _, _ = model.get_action_and_value(
+                            *_model_batch(stack_observations(observations), device),
+                            deterministic=not args.stochastic,
+                        )
+                    joint = actions.cpu().numpy()
+                else:
+                    with torch.no_grad():
+                        learner_action, _, _, _ = model.get_action_and_value(
+                            *_model_batch(stack_observations([observations[learner_slot]]), device),
+                            deterministic=not args.stochastic,
+                        )
+                    other = 1 - learner_slot
+                    joint = np.zeros((TankSelfPlayEnv.num_agents, 3), dtype=np.int64)
+                    joint[learner_slot] = learner_action.cpu().numpy()[0]
+                    joint[other] = opponent.action(0, env.game, env.agent_ids[other], observations[other])
+                observations, _, done, info = env.step(joint)
                 if renderer is not None:
                     renderer.draw(env.game)
                     renderer.tick(max(1, env.game.physics_hz // action_repeat))

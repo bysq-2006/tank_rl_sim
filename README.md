@@ -14,8 +14,7 @@ tank_rl_sim/
 ├─ renderer.py      Pygame 显示，只读取 core 的状态
 ├─ demo.py          键盘试玩入口
 ├─ rl_stage1/        第一关：空场近距离对位
-├─ rl_stage2/        第二关：空场远距离随机朝向
-├─ rl_stage3/        第三关：随机迷宫
+├─ rl_stage3/        迷宫关
 ├─ supervised/       监督学习模块
 │  ├─ train.py       规则导师纯行为克隆训练
 │  ├─ evaluate.py    监督模型与导师评估
@@ -155,19 +154,28 @@ python -m supervised.evaluate --checkpoint checkpoints/approach/latest.pt --task
 
 ### 4. 使用分关强化学习（推荐，不继承监督模型）
 
-三关是三个独立包，默认关卡、奖励和输出目录都写在各自脚本里：
+现在是两个独立包：
 
-1. `rl_stage1` → `checkpoints/combat_stage1_open_close`：空场、近距离对位。
-2. `rl_stage2` → `checkpoints/combat_stage2_open_far`：空场、远距离随机朝向。
-3. `rl_stage3` → `checkpoints/combat_stage3_maze`：随机迷宫。
+1. `rl_stage1`：空场近距离对位。
+2. `rl_stage3`：随机迷宫。
 
-空场关会关掉 A* 靠近奖励。第二关起手动继承上一关权重：
+第三关与第一关共用同一套局部墙图和奖励。迷宫关可以继承第一关权重：
 
 ```powershell
-python -m rl_stage1.train
-python -m rl_stage2.train --initialize-from checkpoints/combat_stage1_open_close/latest.pt
-python -m rl_stage3.train --initialize-from checkpoints/combat_stage2_open_far/latest.pt
+python -m rl_stage1.train --opponent idle --output checkpoints/combat_stage1_vs_idle
+python -m rl_stage1.train --opponent move --initialize-from checkpoints/combat_stage1_vs_idle/latest.pt --output checkpoints/combat_stage1_vs_move
+python -m rl_stage3.train --opponent move --initialize-from checkpoints/combat_stage1_full/latest.pt --output checkpoints/combat_stage3_maze
 ```
+
+默认 `--opponent self` 是两边共用正在更新的策略。也可以让对手用规则脚本或一份冻结模型（只更新自己这边的轨迹）：
+
+```powershell
+python -m rl_stage1.train --opponent aim
+python -m rl_stage1.train --opponent mix
+python -m rl_stage1.train --opponent model --opponent-model checkpoints/combat_stage1_open_close/latest.pt
+```
+
+脚本有 `idle`（站桩）、`move`（会动但不开火）、`random`、`aim`（转向对准后开火）、`chase`（靠近并开火）、`dodge`（侧移躲弹）、`mix`（每局随机抽一种脚本）。
 
 迷宫从零训练直接跑第三关，不要 `--initialize-from`：
 
@@ -183,6 +191,8 @@ python -m rl_stage3.train
 
 ```powershell
 python -m rl_stage1.evaluate --games 10
+python -m rl_stage1.evaluate --games 10 --opponent aim
+python -m rl_stage1.evaluate --games 10 --opponent model --opponent-model checkpoints/combat_stage1_open_close/step_10240.pt
 ```
 
 看迷宫关：
@@ -226,7 +236,7 @@ python -m rl_stage3.train --resume checkpoints/combat_stage3_maze/latest.pt --to
 - `--initialize-from`：继承某个模型的能力，开始一个新的训练阶段。
 - `--resume`：恢复上次中断的位置，继续同一个训练阶段。
 
-每辆坦克的输入包括 `5×128×128` 地图、自身 18 维状态，以及其他坦克和子弹两个可变长集合。CNN 处理地图；坦克和子弹各自经过共享 MLP 再掩码平均，数量变化不改网络结构。旧的固定 96 维向量模型与当前结构不兼容，需要重新训练。
+每辆坦克的输入包括 `1×48×48` 局部墙图、自身 12 维状态（无绝对坐标），以及其他坦克和子弹两个相对自身的可变长集合。CNN 处理墙图；坦克和子弹各自经过共享 MLP 再掩码平均。旧的 `5×128×128` 全图模型与当前结构不兼容，需要重新训练。
 
 PPO 奖励目前只有胜负、超时、自杀和真正生成子弹时的小额 `fire_bonus`。被敌人击毁为 `-1.0`，被自己的子弹击毁为 `-0.1`。具体参数集中在各关 `environment.py` 的 `RewardConfig` 中。`checkpoints/` 已被 Git 忽略，不会误提交较大的模型文件。
 
