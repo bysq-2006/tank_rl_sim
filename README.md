@@ -1,6 +1,6 @@
-# Tank Game Core
+# Tank RL Simulator
 
-这是一个纯游戏模拟项目。游戏核心、显示渲染和试玩入口彼此分开，不包含神经网络、模型观测或训练代码。
+这是一个坦克游戏模拟与强化学习项目。游戏核心、显示渲染、模型观察和训练代码彼此分开；强化学习层不会向核心加入内置决策行为。
 
 ## 目录结构
 
@@ -9,10 +9,21 @@ tank_rl_sim/
 ├─ core/
 │  ├─ game.py       游戏循环、移动、碰撞、开火、胜负
 │  ├─ maze.py       随机迷宫与墙壁数据
+│  ├─ geometry.py   线段与矩形相交
 │  └─ entities.py   坦克和子弹的数据结构
 ├─ renderer.py      Pygame 显示，只读取 core 的状态
 ├─ demo.py          键盘试玩入口
-└─ tests/            核心测试
+├─ rl_stage1/        第一关：空场近距离对位
+├─ rl_stage2/        第二关：空场远距离随机朝向
+├─ rl_stage3/        第三关：随机迷宫
+├─ supervised/       监督学习模块
+│  ├─ train.py       规则导师纯行为克隆训练
+│  ├─ evaluate.py    监督模型与导师评估
+│  └─ teachers/      可扩展的导师策略
+│     ├─ astar.py    稳定驾驶的 A* 导师
+│     └─ weak_combat.py 会寻路、瞄准和开火的规则型弱人机
+├─ tools/            独立视频测速工具
+└─ tests/            核心和强化学习组件测试
 ```
 
 核心按照 24 Hz 固定时间步运行。每次调用 `game.update(...)`，世界前进一个物理帧。核心不包含任何内置决策行为，所有坦克的控制都必须由外部传入。
@@ -57,6 +68,167 @@ python demo.py
 ```powershell
 python -m pytest -q
 ```
+
+## 模型训练使用方法
+
+完整流程是：先模仿 A* 导师学会寻路，再模仿规则型弱人机学会瞄准和开炮，最后让强化学习脚本继承监督模型，继续优化实战策略。
+
+开始前进入项目和 Python 环境：
+
+```powershell
+conda activate teacher
+cd D:\bysq\tank_rl_sim
+```
+
+### 1. 使用 A* 导师训练基础寻路
+
+A* 导师会为当前状态生成油门和转向标签。模型先学习稳定地沿迷宫路径靠近敌人，这一阶段不训练开火。
+
+```powershell
+python -m supervised.train --teacher astar --total-steps 200000 --rows 6 --cols 6 --output checkpoints/approach
+```
+
+训练结果保存在 `checkpoints/approach/latest.pt`，训练指标保存在 `checkpoints/approach/teacher_log.csv`。
+
+### 2. 继承寻路模型并模仿弱人机
+
+弱人机会沿 A* 路径接近敌人；出现无遮挡直射角度时会停车瞄准；还会主动扫描车头能够到达的一圈离散角度，预演直射和一次反弹弹道。当前地点没有安全射击角度时，它会沿 A* 路径寻找最近的直射格子，先移动到射击位置。预测弹道会先击中自己时不会开炮。它会同时提供油门、转向和开火三个监督标签。
+
+监督训练始终由弱人机控制两辆坦克，模型只读取状态并学习弱人机给出的动作，不会在采集过程中接管坦克。建议将这一版纯行为克隆模型保存在新的 `checkpoints/weak_combat_bc/latest.pt`：
+
+```powershell
+python -m supervised.train --teacher weak-combat --initialize-from checkpoints/approach/latest.pt --total-steps 300000 --rows 6 --cols 6 --output checkpoints/weak_combat_bc
+```
+
+日志除了油门和转向准确率，还会记录：
+
+- `fire_acc`：开火和不开火的总体分类准确率。
+- `fire_precision`：模型决定开火时，有多少次符合导师的开火判断。
+- `fire_recall`：导师要求开火时，模型有多少次真的选择开火。
+- `fire_rate`：当前批次中导师给出开火标签的比例。
+- `stop_rate`：当前批次中导师要求停车的比例。
+- `forward_rate`：当前批次中导师要求前进的比例。
+
+开火正样本默认拥有 4 倍分类权重，避免模型因为“不开炮”样本较多而退化成永远不开炮。
+
+如果只想确认程序能否正常启动，可以把训练量改得很小：
+
+```powershell
+python -m supervised.train --teacher weak-combat --total-steps 32 --num-envs 2 --rollout-steps 8 --epochs 1 --minibatch-size 16 --output checkpoints/smoke
+```
+
+### 3. 查看弱人机和监督模型的效果
+
+先看规则型弱人机本身（双方都由导师控制，不是 checkpoint）。有墙应只靠近，无墙应停车对准后直射。`R` 换图，`Esc` 退出：
+
+```powershell
+python -m supervised.watch --teacher weak-combat --rows 6 --cols 6
+```
+
+终端会大约每 0.5 秒打印油门/转向/开火；出现 `fire=1` 或子弹时说明导师在开炮。
+
+也可以用评估入口连续打若干局并统计开火比例：
+
+```powershell
+python -m supervised.evaluate --teacher weak-combat --task combat --games 20
+```
+
+再加载监督模型，显示 20 局自博弈：
+
+```powershell
+python -m supervised.evaluate --checkpoint checkpoints/weak_combat_bc/latest.pt --task combat --games 20
+```
+
+只统计结果而不显示窗口：
+
+```powershell
+python -m supervised.evaluate --checkpoint checkpoints/weak_combat_bc/latest.pt --task combat --games 100 --no-render
+```
+
+评估结果会额外输出 `fire_command_rate`，可以直接检查模型是否选择过开炮。
+
+原来的纯靠近模型仍可这样查看：
+
+```powershell
+python -m supervised.evaluate --checkpoint checkpoints/approach/latest.pt --task approach --games 20
+```
+
+### 4. 使用分关强化学习（推荐，不继承监督模型）
+
+三关是三个独立包，默认关卡、奖励和输出目录都写在各自脚本里：
+
+1. `rl_stage1` → `checkpoints/combat_stage1_open_close`：空场、近距离对位。
+2. `rl_stage2` → `checkpoints/combat_stage2_open_far`：空场、远距离随机朝向。
+3. `rl_stage3` → `checkpoints/combat_stage3_maze`：随机迷宫。
+
+空场关会关掉 A* 靠近奖励。第二关起手动继承上一关权重：
+
+```powershell
+python -m rl_stage1.train
+python -m rl_stage2.train --initialize-from checkpoints/combat_stage1_open_close/latest.pt
+python -m rl_stage3.train --initialize-from checkpoints/combat_stage2_open_far/latest.pt
+```
+
+迷宫从零训练直接跑第三关，不要 `--initialize-from`：
+
+```powershell
+python -m rl_stage3.train
+```
+
+训练输出中的 `fire_rate` 是模型选择开火的决策比例。
+
+### 5. 查看强化学习模型的效果
+
+评估会默认使用 checkpoint 里保存的布局和出生方式。看第一关：
+
+```powershell
+python -m rl_stage1.evaluate --games 10
+```
+
+看迷宫关：
+
+```powershell
+python -m rl_stage3.evaluate --games 10
+```
+
+只统计结果而不显示窗口：
+
+```powershell
+python -m rl_stage3.evaluate --games 100 --no-render
+```
+
+### 6. 从断点继续同一种训练
+
+如果训练被提前停止，应使用 `--resume`，而不是 `--initialize-from`。`--resume` 会同时恢复模型参数、Adam 优化器状态和累计步数。
+
+继续弱人机监督学习，例如从当前进度训练到累计 500000 步：
+
+```powershell
+python -m supervised.train --resume checkpoints/weak_combat_bc/latest.pt --total-steps 500000
+```
+
+继续某一关 PPO，对该关目录用 `--resume`：
+
+```powershell
+python -m rl_stage1.train --resume checkpoints/combat_stage1_open_close/latest.pt --total-steps 150000
+```
+
+继续迷宫 PPO：
+
+```powershell
+python -m rl_stage3.train --resume checkpoints/combat_stage3_maze/latest.pt --total-steps 400000
+```
+
+`--total-steps` 表示最终希望达到的累计步数，并不是本次额外增加的步数。不指定 `--output` 时，续训结果会继续保存在 checkpoint 所在目录。
+
+简而言之：
+
+- `--initialize-from`：继承某个模型的能力，开始一个新的训练阶段。
+- `--resume`：恢复上次中断的位置，继续同一个训练阶段。
+
+每辆坦克的输入包括 `5×128×128` 地图、自身 18 维状态，以及其他坦克和子弹两个可变长集合。CNN 处理地图；坦克和子弹各自经过共享 MLP 再掩码平均，数量变化不改网络结构。旧的固定 96 维向量模型与当前结构不兼容，需要重新训练。
+
+PPO 奖励目前只有胜负、超时、自杀和真正生成子弹时的小额 `fire_bonus`。被敌人击毁为 `-1.0`，被自己的子弹击毁为 `-0.1`。具体参数集中在各关 `environment.py` 的 `RewardConfig` 中。`checkpoints/` 已被 Git 忽略，不会误提交较大的模型文件。
 
 ## 视频速度测量工具
 
