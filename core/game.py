@@ -24,6 +24,8 @@ class TankGame:
         self.fixed_cols = cols  # 固定地图列数；None 表示每局随机。
         self.tank_half_length = 0.22795  # 实测车身前后长度 0.4559 格的一半。
         self.tank_half_width = 0.16945  # 实测车身左右宽度 0.3389 格的一半。
+        self.barrel_length = 0.26795  # 炮管从车身中心到炮口，参与撞墙，避免插入墙内。
+        self.barrel_width = 0.091  # 炮管显示宽度，同样用于撞墙。
         self.wall_thickness = 0.0735  # 实测地图内部墙和外边框的统一宽度。
         self.max_speed = 1.8622  # 根据视频测量得到的坦克最大前进/后退速度，单位为格子/秒。
         self.acceleration = 7.0  # 坦克每秒最多增加或减少的速度。
@@ -41,6 +43,8 @@ class TankGame:
         self.bullets: list[Bullet] = []  # 当前仍在飞行的全部子弹。
         self.wall_rects: list[tuple[float, float, float, float]] = []  # 用于碰撞检测的墙矩形。
         self.elapsed = 0.0  # 当前局已经推进的游戏时间。
+        self.death_grace = 3.4  # 首辆坦克死亡后，再等待这么多秒才结束对局。
+        self.first_death_at: float | None = None  # 首次出现死亡时的 elapsed；None 表示尚未有坦克死亡。
         self.is_over = False  # 当前局是否已经结束。
         self.winner: int | None = None  # 获胜坦克的 tank_id；None 表示未结束或无胜者。
         self.reset()
@@ -61,6 +65,7 @@ class TankGame:
         ]
         self.bullets = []
         self.elapsed = 0.0
+        self.first_death_at = None
         self.is_over = False
         self.winner = None
 
@@ -91,6 +96,11 @@ class TankGame:
     def _update_game_result(self) -> None:
         """根据坦克存活状态和时间限制更新结束状态与胜者。"""
         if any(not tank.alive for tank in self.tanks):
+            if self.first_death_at is None:
+                self.first_death_at = self.elapsed
+            # 宽限期内世界继续运转：剩余子弹仍可能打死另一方。
+            if self.elapsed - self.first_death_at < self.death_grace:
+                return
             self.is_over = True
             survivors = [tank.tank_id for tank in self.tanks if tank.alive]
             self.winner = survivors[0] if len(survivors) == 1 else None
@@ -155,19 +165,19 @@ class TankGame:
         else:
             tank.speed *= 0.25
 
-    def _tank_corners(self, x: float, y: float, heading: float) -> list[tuple[float, float]]:
-        """返回旋转后正方形坦克的四个世界坐标顶点。"""
+    def _tank_corners(self, x: float, y: float, heading: float, front: float | None = None) -> list[tuple[float, float]]:
+        """返回旋转矩形的四个顶点。撞墙时 front 用炮管长度，绘制车身时用车身半长。"""
         forward = (math.cos(heading), math.sin(heading))
         right = (-forward[1], forward[0])
-        half_length = self.tank_half_length
+        back, nose = self.tank_half_length, self.tank_half_length if front is None else front
         half_width = self.tank_half_width
         return [
-            (x + forward[0] * a * half_length + right[0] * b * half_width, y + forward[1] * a * half_length + right[1] * b * half_width)
-            for a, b in ((-1, -1), (-1, 1), (1, 1), (1, -1))
+            (x + forward[0] * a + right[0] * b * half_width, y + forward[1] * a + right[1] * b * half_width)
+            for a, b in ((-back, -1), (-back, 1), (nose, 1), (nose, -1))
         ]
 
     def _tank_hits_wall(self, x: float, y: float, heading: float) -> bool:
-        """使用分离轴方法判断旋转正方形坦克是否与墙壁相交。"""
+        """使用分离轴方法判断带炮管的坦克是否与墙壁相交。"""
         return any(self._tank_wall_separation(x, y, heading, wall) is not None for wall in self.wall_rects)
 
     def _tank_wall_separation(
@@ -177,8 +187,8 @@ class TankGame:
         heading: float,
         wall: tuple[float, float, float, float],
     ) -> tuple[float, float] | None:
-        """返回将旋转矩形坦克推出一面墙所需的最小位移。"""
-        tank_corners = self._tank_corners(x, y, heading)
+        """返回将带炮管的旋转矩形推出一面墙所需的最小位移。"""
+        tank_corners = self._tank_corners(x, y, heading, front=self.barrel_length)
         axes = [(1.0, 0.0), (0.0, 1.0), (math.cos(heading), math.sin(heading)), (-math.sin(heading), math.cos(heading))]
         x0, y0, x1, y1 = wall
         wall_corners = [(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
@@ -194,7 +204,6 @@ class TankGame:
                 smallest_overlap = overlap
                 smallest_axis = (ax, ay)
 
-        # 将最短分离轴指向从墙中心到坦克中心的方向。
         ax, ay = smallest_axis
         wall_center_x, wall_center_y = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         if (x - wall_center_x) * ax + (y - wall_center_y) * ay < 0.0:
@@ -231,15 +240,13 @@ class TankGame:
             return
         offset = self.tank_half_length + self.bullet_radius + 0.04
         ux, uy = math.cos(tank.heading), math.sin(tank.heading)
-        self.bullets.append(
-            Bullet(
-                tank.x + ux * offset,
-                tank.y + uy * offset,
-                ux * self.bullet_speed,
-                uy * self.bullet_speed,
-                owner_tank_id=tank.tank_id,
-            )
-        )
+        x, y = tank.x + ux * offset, tank.y + uy * offset
+        vx, vy, bounces = ux * self.bullet_speed, uy * self.bullet_speed, 0
+        if self._circle_hits_wall(x, y, self.bullet_radius):
+            x = tank.x + ux * (self.tank_half_length - self.bullet_radius)
+            y = tank.y + uy * (self.tank_half_length - self.bullet_radius)
+            vx, vy, bounces = -vx, -vy, 1
+        self.bullets.append(Bullet(x, y, vx, vy, owner_tank_id=tank.tank_id, bounces=bounces))
         # 使用累加而不是覆盖，以保留固定帧更新产生的少量超时误差。
         tank.cooldown += self.fire_cooldown
 
@@ -265,8 +272,7 @@ class TankGame:
     def _bullet_hit(self, bullet: Bullet) -> Tank | None:
         """返回被子弹命中的坦克；反弹弹可以命中其发射者。"""
         for tank in self.tanks:
-            # 短暂忽略刚出膛的子弹，避免它在炮口处立即碰到发射者。
-            if not tank.alive or bullet.age < 0.08:
+            if not tank.alive:
                 continue
             cos_h, sin_h = math.cos(tank.heading), math.sin(tank.heading)
             dx, dy = bullet.x - tank.x, bullet.y - tank.y

@@ -42,7 +42,7 @@ def generate_maze(
     rows: int | None = None,
     cols: int | None = None,
     min_size: int = 6,
-    max_size: int = 12,
+    max_size: int = 9,
     loop_probability: float = 0.08,
 ) -> Maze:
     """生成连通迷宫，并随机拆除少量内部墙形成环路。"""

@@ -81,6 +81,8 @@ def test_measured_object_dimensions_are_used():
     game = TankGame(rows=6, cols=6)
     assert game.tank_half_length * 2 == pytest.approx(0.4559)
     assert game.tank_half_width * 2 == pytest.approx(0.3389)
+    assert game.barrel_length == pytest.approx(0.26795)
+    assert game.barrel_width == pytest.approx(0.091)
     assert game.bullet_radius * 2 == pytest.approx(0.09)
 
 
@@ -110,6 +112,48 @@ def test_requested_lifetime_and_uniform_wall_width():
     game = TankGame(rows=6, cols=6)
     assert game.bullet_lifetime == 10.0
     assert game.wall_thickness == pytest.approx(0.0735)
+
+
+def test_barrel_cannot_enter_a_wall():
+    game = TankGame(rows=6, cols=6)
+    game.reset(seed=1)
+    tank = game.tanks[0]
+    tank.x = game.wall_thickness / 2 + 0.01
+    tank.y = 1.5
+    tank.heading = math.pi
+    assert game._tank_hits_wall(tank.x, tank.y, tank.heading)
+    assert game._push_tank_out_of_walls(tank)
+    assert not game._tank_hits_wall(tank.x, tank.y, tank.heading)
+    assert tank.x >= game.barrel_length + game.wall_thickness / 2
+
+
+def test_firing_into_a_nearby_wall_kills_the_shooter():
+    game = TankGame(rows=6, cols=6)
+    game.reset(seed=1)
+    tank = game.tanks[0]
+    tank.x = game.barrel_length + game.wall_thickness / 2 + 0.01
+    tank.y = 1.5
+    tank.heading = math.pi
+    tank.cooldown = 0.0
+    assert not game._tank_hits_wall(tank.x, tank.y, tank.heading)
+    events = []
+    for _ in range(8):
+        events.extend(game.update([(1, 1, 1), (1, 1, 0)]))
+        if not tank.alive:
+            break
+    assert not tank.alive
+    assert any(event["shooter"] == tank.tank_id and event["victim"] == tank.tank_id for event in events)
+
+
+def test_fresh_shot_does_not_destroy_the_shooter():
+    game = TankGame(rows=6, cols=6)
+    game.reset(seed=2)
+    tank = game.tanks[0]
+    tank.cooldown = 0.0
+    game._fire(tank)
+    game.update([(1, 1, 0), (1, 1, 0)])
+    assert tank.alive
+    assert any(bullet.owner_tank_id == tank.tank_id for bullet in game.bullets)
 
 
 def test_each_tank_can_have_at_most_five_active_bullets():
@@ -173,11 +217,40 @@ def test_one_bullet_hit_immediately_destroys_tank():
     events = game.update([(1, 1, 0), (1, 1, 0)])
 
     assert not target.alive
-    assert game.is_over
-    assert game.winner == game.tanks[0].tank_id
+    assert not game.is_over
+    assert game.winner is None
     assert events[0]["shooter"] == game.tanks[0].tank_id
     assert events[0]["victim"] == target.tank_id
     assert events[0]["bullet_age"] >= 1.0
+
+    while game.elapsed - game.first_death_at < game.death_grace:
+        game.update([(1, 1, 0), (1, 1, 0)])
+
+    assert game.is_over
+    assert game.winner == game.tanks[0].tank_id
+
+
+def test_remaining_tank_can_die_during_death_grace():
+    game = TankGame(rows=6, cols=6)
+    game.reset(seed=6)
+    first, second = game.tanks
+    game.bullets.append(Bullet(second.x, second.y, 0.0, 0.0, owner_tank_id=first.tank_id, age=1.0))
+    game.update([(1, 1, 0), (1, 1, 0)])
+    assert not second.alive
+    assert first.alive
+    assert not game.is_over
+
+    game.bullets.append(Bullet(first.x, first.y, 0.0, 0.0, owner_tank_id=second.tank_id, age=1.0))
+    events = game.update([(1, 1, 0), (1, 1, 0)])
+    assert not first.alive
+    assert events[0]["victim"] == first.tank_id
+    assert not game.is_over
+
+    while game.elapsed - game.first_death_at < game.death_grace:
+        game.update([(1, 1, 0), (1, 1, 0)])
+
+    assert game.is_over
+    assert game.winner is None
 
 
 def test_many_random_updates_remain_finite():
