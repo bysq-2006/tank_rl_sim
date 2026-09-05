@@ -85,7 +85,7 @@ cd D:\bysq\tank_rl_sim
 
 ```powershell
 python -m supervised.collect `
-  --output datasets/hunter_exact_v4 `
+  --output datasets/hunter_pixel_v5 `
   --seed-start 10000 `
   --train-seeds 800 `
   --validation-seeds 200 `
@@ -99,10 +99,10 @@ python -m supervised.collect `
 
 ```powershell
 python -m supervised.train_offline `
-  --dataset datasets/hunter_exact_v4 `
+  --dataset datasets/hunter_pixel_v5 `
   --epochs 20 `
   --fire-weight 6 `
-  --output checkpoints/hunter_bc_exact_v4
+  --output checkpoints/hunter_bc_pixel_v5
 ```
 
 模型直接学习18类联合动作；日志仍把油门、转向、开火的边缘 loss/准确率和开火 precision/recall 拆开显示。`supervised.train` 的边采边训方式保留用于旧实验，但不再作为推荐入口。
@@ -116,7 +116,7 @@ python -m supervised.watch --rows 6 --cols 6
 看克隆模型打人机：
 
 ```powershell
-python -m supervised.evaluate --checkpoint checkpoints/hunter_bc_exact_v4/latest.pt --games 200 --no-render
+python -m supervised.evaluate --checkpoint checkpoints/hunter_bc_pixel_v5/latest.pt --games 200 --no-render
 ```
 
 ### 2. 强化学习
@@ -126,11 +126,11 @@ python -m supervised.evaluate --checkpoint checkpoints/hunter_bc_exact_v4/latest
 ```powershell
 python -m rl.train `
   --opponent hunter `
-  --initialize-from checkpoints/hunter_bc_exact_v4/latest.pt `
+  --initialize-from checkpoints/hunter_bc_pixel_v5/latest.pt `
   --teacher-coef 0 `
   --potential-scale 0.2 `
   --opponent-self-kill-reward 0 `
-  --output checkpoints/RL_exact_v4_hunter `
+  --output checkpoints/RL_pixel_v5_hunter `
   --total-steps 300000
 ```
 
@@ -140,13 +140,13 @@ python -m rl.train `
 
 ```powershell
 python -m rl.train `
-  --initialize-from checkpoints/RL_exact_v4_hunter/latest.pt `
-  --opponent hunter checkpoints/RL_exact_v4_hunter/latest.pt `
+  --initialize-from checkpoints/RL_pixel_v5_hunter/latest.pt `
+  --opponent hunter checkpoints/RL_pixel_v5_hunter/latest.pt `
   --opponent-weights 0.5 0.5 `
   --teacher-coef 0 `
   --potential-scale 0.2 `
   --opponent-self-kill-reward 0 `
-  --output checkpoints/RL_exact_v4_pool1 `
+  --output checkpoints/RL_pixel_v5_pool1 `
   --total-steps 300000
 ```
 
@@ -155,18 +155,18 @@ python -m rl.train `
 观战：
 
 ```powershell
-python -m rl.evaluate --checkpoint checkpoints/RL_exact_v4_hunter/latest.pt --opponent hunter --games 200 --no-render
+python -m rl.evaluate --checkpoint checkpoints/RL_pixel_v5_hunter/latest.pt --opponent hunter --games 200 --no-render
 ```
 
 正式比较建议至少打 200 局。默认相邻两局复用同一地图并交换双方位置，结果会给出 95% 置信区间：
 
 ```powershell
-python -m rl.evaluate --checkpoint checkpoints/RL_exact_v4_hunter/latest.pt --opponent hunter --games 200 --seed 8000 --no-render
+python -m rl.evaluate --checkpoint checkpoints/RL_pixel_v5_hunter/latest.pt --opponent hunter --games 200 --seed 8000 --no-render
 ```
 
 `--resume` 继续同一次训练；`--initialize-from` 只拷权重、步数从 0 开始。
 
-每辆坦克输入完整的 `5×12×12` 精确墙拓扑（四向墙和有效区域），支持每局随机的 `6..12` 行列。动态实体不栅格化：最多两个其他坦克和十五颗子弹都保留连续坐标，并按精确位置从墙体 CNN 特征图双线性取样。实体集合用共享 MLP 和 `sum+max` 汇总；策略使用单个18类联合动作头。模型无 A* 路点、墙距射线、注意力和 LSTM，共约11.2万参数。
+每辆坦克输入完整的 `2×96×96` 像素图（墙体和有效区域），支持每局随机的 `6..12` 行列，每格对应8个像素。动态实体不栅格化：最多两个其他坦克和十五颗子弹都保留连续坐标，并按精确位置从墙体 CNN 特征图双线性取样。实体集合用共享 MLP 和 `sum+max` 汇总；策略使用单个18类联合动作头。模型无 A* 路点、墙距射线、注意力和 LSTM，共约14万参数。
 
 观察和动作头均已更换，因此所有旧 checkpoint 和旧离线数据都不能与新版混用；监督学习必须重新采集并从随机初始化训练。
 

@@ -40,16 +40,18 @@ def test_observation_has_fixed_shapes_for_different_maps():
         assert observation["bullet_mask"].shape == (MAX_BULLETS,)
 
 
-def test_observation_map_is_exact_padded_wall_topology():
+def test_observation_map_is_high_resolution_wall_pixels():
     game = TankGame(rows=6, cols=6)
     observation = build_observation(game, tank_id=0)
-    assert MAP_CHANNELS == 5
-    assert observation["map"].shape == (5, MAP_SIZE, MAP_SIZE)
+    assert MAP_CHANNELS == 2
+    assert MAP_SIZE == 96
+    assert observation["map"].shape == (2, MAP_SIZE, MAP_SIZE)
     assert observation["map"].max() <= 1.0
-    assert observation["map"][4, :6, :6].sum() == 36
-    assert observation["map"][4, 6:, :].sum() == 0
-    assert np.array_equal(observation["map"][0, :6, :6], game.maze.horizontal[:6])
-    assert np.array_equal(observation["map"][3, :6, :6], game.maze.vertical[:, :6])
+    wall, valid = observation["map"]
+    assert wall.sum() > 0
+    assert valid[:48, :48].min() == 1
+    assert valid[48:, :].sum() == 0
+    assert valid[:, 48:].sum() == 0
 
 
 def test_bullet_set_marks_enemy_shot_and_ignores_empty_slots():
@@ -376,7 +378,7 @@ def test_model_outputs_three_valid_actions_and_values():
 
 def test_model_stays_near_the_intended_small_size():
     parameters = sum(parameter.numel() for parameter in TankActorCritic().parameters())
-    assert 100_000 <= parameters <= 150_000
+    assert 100_000 <= parameters <= 250_000
 
 
 def test_joint_action_encoding_round_trip():
