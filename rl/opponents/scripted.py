@@ -6,6 +6,7 @@ from typing import Protocol
 import numpy as np
 
 from core import TankGame
+from core.geometry import segment_intersects_rect
 
 
 Control = tuple[int, int, int]
@@ -54,6 +55,67 @@ class RandomMoverOpponent:
         return self.action
 
 
+class DodgerOpponent:
+    """追踪瞄准并在检测到来袭子弹时侧向闪避的简单对手。"""
+
+    def __init__(self, rng: np.random.Generator, fire_probability: float = 0.25) -> None:
+        # 初始化追踪、闪避和低频开火所需的随机状态。
+        self.rng = rng
+        self.fire_probability = fire_probability
+        self.remaining = 0
+        self.action: Control = (2, 1, 0)
+
+    def act(self, game: TankGame, tank_id: int) -> Control:
+        # 优先躲避预计一秒内命中的子弹，否则追踪最近敌人并在瞄准后开火。
+        own = _find_tank(game, tank_id)
+        threats: list[tuple[float, float, float]] = []
+        for bullet in game.bullets:
+            if bullet.owner_tank_id == tank_id:
+                continue
+            dx, dy = own.x - bullet.x, own.y - bullet.y
+            speed_squared = bullet.vx * bullet.vx + bullet.vy * bullet.vy
+            if speed_squared <= 1e-8:
+                continue
+            time_to_closest = (bullet.vx * dx + bullet.vy * dy) / speed_squared
+            if not 0.0 < time_to_closest < 1.0:
+                continue
+            closest_x = dx - bullet.vx * time_to_closest
+            closest_y = dy - bullet.vy * time_to_closest
+            closest_distance = math.hypot(closest_x, closest_y)
+            if closest_distance < 0.65:
+                lateral = bullet.vx * dy - bullet.vy * dx
+                threats.append((closest_distance, lateral, time_to_closest))
+        if threats:
+            _, lateral, _ = min(threats, key=lambda item: item[0])
+            self.action = (2, 2 if lateral >= 0.0 else 0, 0)
+            self.remaining = 5
+            self.remaining -= 1
+            return self.action
+
+        enemies = [tank for tank in game.tanks if tank.tank_id != tank_id and tank.alive]
+        if not own.alive or not enemies:
+            return 1, 1, 0
+        target = min(enemies, key=lambda tank: math.hypot(tank.x - own.x, tank.y - own.y))
+        dx, dy = target.x - own.x, target.y - own.y
+        distance = math.hypot(dx, dy)
+        target_angle = math.atan2(dy, dx)
+        error = _wrapped_angle(target_angle - own.heading)
+        steer = 2 if error > math.radians(5) else 0 if error < -math.radians(5) else 1
+        throttle = 0 if distance < 1.2 else 2 if distance > 2.5 else 1
+        line_of_sight = not any(
+            segment_intersects_rect(own.x, own.y, target.x, target.y, wall)
+            for wall in game.wall_rects
+        )
+        fire = int(
+            abs(error) < math.radians(12)
+            and line_of_sight
+            and self.rng.random() < self.fire_probability
+        )
+        self.action = (throttle, steer, fire)
+        self.remaining = 0
+        return self.action
+
+
 class WeakShooterOpponent(RandomMoverOpponent):
     def __init__(self, rng: np.random.Generator, fire_probability: float) -> None:
         # 初始化随机移动和低频开火参数。
@@ -94,6 +156,8 @@ def make_opponent(name: str, rng: np.random.Generator, fire_probability: float =
         return IdleOpponent()
     if name == "random_mover":
         return RandomMoverOpponent(rng)
+    if name == "dodger":
+        return DodgerOpponent(rng, fire_probability)
     if name == "weak_shooter":
         return WeakShooterOpponent(rng, fire_probability)
     if name == "chaser":

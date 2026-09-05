@@ -146,6 +146,10 @@ class TrainingDashboard:
         kl_axis.legend(loc="upper right")
 
         axes[2, 0].plot(updates, self._series("shots_per_game"), label="每个完成对局平均开炮数")
+        axes[2, 0].plot(
+            updates, self._series("unsafe_shots_per_game"),
+            color="tab:red", label="每个完成对局平均危险开炮数",
+        )
         history_axis = axes[2, 0].twinx()
         history_axis.plot(
             updates, self._series("historical_opponent_ratio"),

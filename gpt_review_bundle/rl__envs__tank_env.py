@@ -16,7 +16,7 @@ from .scenarios import apply_layout, apply_spawn
 class TankRLEnv:
     """将纯物理核心包装为单智能体课程学习环境。"""
 
-    def __init__(self, action_repeat: int = 1, controlled_tank_id: int = 0, opponent_pool=None) -> None:
+    def __init__(self, action_repeat: int = 2, controlled_tank_id: int = 0, opponent_pool=None) -> None:
         # 初始化动作重复次数和受控坦克编号。
         if action_repeat < 1:
             raise ValueError("action_repeat must be positive")

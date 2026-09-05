@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-historical-opponents", action="store_true")
     parser.add_argument("--no-dashboard", action="store_true")
     parser.add_argument("--dashboard-points", type=int, default=1000)
-    parser.add_argument("--action-repeat", type=int, default=2)
+    parser.add_argument("--action-repeat", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -74,6 +74,7 @@ def _result_counts(results: list[dict]) -> dict[str, int]:
         "本轮超时局数": 0,
         "本轮历史模型对局数": 0,
         "本轮己方实际开炮数": 0,
+        "本轮危险开炮数": 0,
         "本轮敌方自毁局数": 0,
     }
     labels = {
@@ -87,6 +88,7 @@ def _result_counts(results: list[dict]) -> dict[str, int]:
             counts[labels[item["result"]]] += 1
         counts["本轮历史模型对局数"] += int(item.get("historical_opponent", False))
         counts["本轮己方实际开炮数"] += int(item.get("shots_fired", 0))
+        counts["本轮危险开炮数"] += int(item.get("unsafe_shots", 0))
         counts["本轮敌方自毁局数"] += int(item.get("opponent_self_kill", False))
     return counts
 
@@ -212,6 +214,10 @@ def train(args: argparse.Namespace) -> None:
             ),
             "shots_per_game": (
                 result_counts["本轮己方实际开炮数"] / completed_games
+                if completed_games else None
+            ),
+            "unsafe_shots_per_game": (
+                result_counts["本轮危险开炮数"] / completed_games
                 if completed_games else None
             ),
             "historical_opponent_ratio": (

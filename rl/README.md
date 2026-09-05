@@ -56,7 +56,7 @@ python -m rl.evaluation.watch `
 
 ### 实时训练图表
 
-训练命令启动后会默认弹出独立的实时折线图窗口，展示训练奖励、训练与评估胜率、超时率、策略/价值损失、策略熵、KL、平均开炮数、历史对手占比、当前关卡和学习率。关闭图表窗口不会停止训练。
+训练命令启动后会默认弹出独立的实时折线图窗口，展示训练奖励、训练与评估胜率、超时率、策略/价值损失、策略熵、KL、平均开炮数、危险开炮数、历史对手占比、当前关卡和学习率。关闭图表窗口不会停止训练。
 
 每轮原始指标都会追加到输出目录的 `training_metrics.jsonl`；每次保存预览模型时还会更新 `training_dashboard.png`。续训会读取检查点之前的历史指标并接着绘制。最多在窗口显示最近 1000 个点，可以修改或关闭窗口：
 
@@ -73,6 +73,18 @@ python -m rl.training.train --output checkpoints\new_run --no-dashboard --total-
 ```powershell
 python -m rl.training.train --stage 3 --output checkpoints\stage3_auto --total-steps 3000000
 ```
+
+如果要从第三关开始、完全固定使用简单闪避敌人，先使用固定关卡训练：
+
+```powershell
+python -m rl.training.train `
+  --stage 3 `
+  --fixed-stage `
+  --output checkpoints\stage3_dodger `
+  --total-steps 1000000
+```
+
+从第三关开始自动晋级时，课程抽样会自动排除第 0～2 关的 `idle` 敌人；第 3 关及之后只会混合闪避、移动、射击和历史模型对手。
 
 只训练第 3 阶段，不混入旧阶段、下一阶段，也不自动晋级：
 
@@ -119,7 +131,17 @@ python -m rl.evaluation.watch `
   --stage 6
 ```
 
-脚本对手可选 `idle`、`random_mover`、`weak_shooter` 和 `chaser`。省略 `--stage` 时读取主检查点保存的当前阶段；`--games 0` 持续播放，空格、回车或 `N` 跳过当前局，`Esc` 退出。
+脚本对手可选 `idle`、`random_mover`、`dodger`、`weak_shooter` 和 `chaser`。`dodger` 会追踪、瞄准并低频开火，同时在发现预计一秒内会命中的子弹时做简单侧向闪避；它只在无遮挡时开火，减少对墙自毁。省略 `--stage` 时读取主检查点保存的当前阶段；`--games 0` 持续播放，空格、回车或 `N` 跳过当前局，`Esc` 退出。
+
+如果想让观战对手按照训练该关卡时的配置自动选择，使用 `--opponent training`。它会使用该关卡的脚本类型和开火概率，并按历史模型概率从同一训练目录的对手池中抽取旧模型（如果池中已有模型）：
+
+```powershell
+python -m rl.evaluation.watch `
+  --checkpoint checkpoints\tank_rl_curriculum_v2\latest.pt `
+  --stage 3 `
+  --opponent training `
+  --games 0
+```
 
 ## 历史模型对手
 
@@ -145,8 +167,10 @@ python -m rl.training.train --no-historical-opponents --output checkpoints\scrip
 
 - 最终胜利 `+1`；失败、双方死亡和超时 `-1`。
 - 前期主动击杀最多额外 `+0.30`，自身死亡额外 `-0.30`。
-- 每次实际成功发射子弹奖励 `+0.01`，每局最多奖励 `+0.05`；冷却或弹数已满时反复按键不奖励。
+- 不再因为普通开炮本身给奖励；冷却或弹数已满时反复按键也不奖励。
+- 发射前会按真实墙体反弹轨迹预演：预测会撞回自己的子弹，该发射扣 `0.03`。日志中的 `本轮危险开炮数` 记录这类开火。
 - 如果敌人用自己的子弹把自己打死，该局标记为“敌方自毁”，玩家不会得到胜利奖励，也不会额外扣分；评估时不会计入胜率，避免转圈诱导敌人自毁形成高分捷径。
+- 第 3～6 关的自身被击毁即时惩罚分别为 `-0.35`、`-0.30`、`-0.25`、`-0.20`，再叠加失败终局的 `-1.0`，让躲避子弹比无脑冒险更重要。
 - 即时奖励和势函数奖励随阶段逐渐减小，最终完整脚本阶段分别降到 `0.05`。
 - PPO 使用 `gamma=0.995`、`GAE lambda=0.99` 将延迟命中奖励向前传递；约 3 秒前的动作仍能收到约 58% 的信用，约 5 秒前仍有约 40%。
 - 子弹发射者只用于训练奖励判断，不进入模型观察。

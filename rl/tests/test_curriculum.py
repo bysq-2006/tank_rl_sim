@@ -3,6 +3,7 @@ import numpy as np
 from rl.curriculum import STAGES, CurriculumManager
 from rl.envs import TankRLEnv
 from rl.observation import build_observation
+from rl.opponents import DodgerOpponent
 
 
 def test_every_stage_can_reset_and_step():
@@ -50,8 +51,8 @@ def test_stage_zero_spawns_tanks_far_apart_with_random_headings():
     assert len(set(headings)) > 1
 
 
-def test_successful_fire_gets_small_capped_reward():
-    # 验证实际开炮获得小额奖励且同一局累计奖励不会超过上限。
+def test_targeted_fire_reward_and_dangerous_fire_stays_capped():
+    # 验证无目标轨迹会受罚，而直接调用旧接口的奖励上限仍兼容。
     firing_env = TankRLEnv(action_repeat=1)
     idle_env = TankRLEnv(action_repeat=1)
     firing_env.reset(STAGES[0], seed=321)
@@ -59,7 +60,7 @@ def test_successful_fire_gets_small_capped_reward():
     _, firing_reward, _, firing_info = firing_env.step((1, 1, 1))
     _, idle_reward, _, _ = idle_env.step((1, 1, 0))
     assert firing_info["shots_fired"] == 1
-    assert np.isclose(firing_reward - idle_reward, STAGES[0].reward.shot_reward)
+    assert firing_reward < idle_reward
 
     capped_env = TankRLEnv(action_repeat=1)
     capped_env.reset(STAGES[0], seed=654)
@@ -71,6 +72,21 @@ def test_successful_fire_gets_small_capped_reward():
         capped_env.reward_tracker.shot_reward_paid,
         STAGES[0].reward.max_shot_reward,
     )
+
+
+def test_self_hit_trajectory_gets_fire_penalty():
+    # 验证发射前预测会命中自身的子弹得到危险开火负奖励。
+    env = TankRLEnv(action_repeat=1)
+    env.reset(STAGES[0], seed=123)
+    own, enemy = env.game.tanks[:2]
+    own.x, own.y, own.heading = 1.5, 3.0, np.pi
+    enemy.x, enemy.y = 4.5, 3.0
+    env.reward_tracker.reset(env.game)
+    assert env.game.would_shot_hit_self(own)
+    _, reward, _, info = env.step((1, 1, 1))
+    assert info["unsafe_shots"] == 1
+    assert reward < 0.0
+    assert env.reward_tracker.shot_reward_paid == 0.0
 
 
 def test_opponent_self_kill_is_not_counted_as_player_win():
@@ -85,6 +101,24 @@ def test_opponent_self_kill_is_not_counted_as_player_win():
     )
     assert env._result() == "opponent_self_kill"
     assert np.isclose(reward, STAGES[0].reward.opponent_self_kill_reward)
+
+
+def test_stage_three_uses_simple_dodger_opponent():
+    # 验证第三关使用简单闪避脚本并能持续输出合法动作。
+    env = TankRLEnv(action_repeat=1)
+    env.reset(STAGES[3], seed=456)
+    assert isinstance(env.opponent, DodgerOpponent)
+    for _ in range(20):
+        _, _, done, _ = env.step((1, 1, 0))
+        if done:
+            break
+
+
+def test_curriculum_from_stage_three_does_not_sample_idle_stages():
+    # 验证从第三关开始自动混合训练时不会再抽到静止敌人关卡。
+    curriculum = CurriculumManager(start_stage=3, seed=789)
+    sampled = [curriculum.sample_stage() for _ in range(500)]
+    assert all(stage.index >= 3 for stage in sampled)
 
 
 def test_bullet_hidden_truth_does_not_change_observation():

@@ -16,23 +16,26 @@ from rl.curriculum import STAGES, STAGE_TITLES
 from rl.envs.scenarios import apply_layout, apply_spawn
 from rl.model import TankActorCritic
 from rl.observation import build_observation
-from rl.opponents import make_opponent
+from rl.opponents import HistoricalOpponentPool, make_opponent
 from rl.training.rollout import stack_observations
 
 
-SCRIPTED_OPPONENTS = ("idle", "random_mover", "weak_shooter", "chaser")
+SCRIPTED_OPPONENTS = ("idle", "random_mover", "dodger", "weak_shooter", "chaser")
 
 
 def parse_args() -> argparse.Namespace:
     # 解析主模型、对手、关卡、局数和播放速度等观战参数。
     parser = argparse.ArgumentParser(description="使用现有渲染器观看模型对战")
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/tank_rl_curriculum_v2/latest.pt"))
-    parser.add_argument("--opponent", default="chaser", help="脚本策略名称或另一个.pt检查点")
+    parser.add_argument(
+        "--opponent", default="chaser",
+        help="脚本策略、另一个.pt检查点，或 training（按该关训练配置抽取）",
+    )
     parser.add_argument("--stage", type=int, choices=range(len(STAGES)))
     parser.add_argument("--games", type=int, default=0, help="0表示持续播放")
     parser.add_argument("--seed", type=int, default=2_000_000)
     parser.add_argument("--speed", type=float, default=1.0)
-    parser.add_argument("--action-repeat", type=int, default=2)
+    parser.add_argument("--action-repeat", type=int, default=1)
     parser.add_argument("--sample-actions", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -76,14 +79,46 @@ class ModelController:
         return tuple(int(value) for value in action[0].cpu().tolist())
 
 
-def _opponent_controller(name_or_path: str, device: torch.device, rng: np.random.Generator, deterministic: bool):
+def _opponent_controller(
+    name_or_path: str,
+    device: torch.device,
+    rng: np.random.Generator,
+    deterministic: bool,
+    fire_probability: float | None = None,
+):
     # 根据参数创建脚本控制器或另一个检查点模型控制器。
     if name_or_path in SCRIPTED_OPPONENTS:
-        probability = 0.10 if name_or_path == "weak_shooter" else 0.80
+        probability = (
+            0.10 if name_or_path == "weak_shooter" else 0.80
+            if fire_probability is None else fire_probability
+        )
         return make_opponent(name_or_path, rng, probability), name_or_path
     path = Path(name_or_path)
     model, _ = _load_model(path, device)
     return ModelController(model, device, deterministic), path.name
+
+
+def _training_output_directory(checkpoint: Path) -> Path:
+    # 从最新检查点或预览检查点反推出对应的训练输出目录。
+    resolved = checkpoint.resolve()
+    return resolved.parent.parent if resolved.parent.name == "previews" else resolved.parent
+
+
+def _resolve_training_opponent(
+    stage,
+    checkpoint: Path,
+    device: torch.device,
+    rng: np.random.Generator,
+) -> tuple[str, str]:
+    # 按训练关卡的历史模型概率和脚本配置选择一名实际观战对手。
+    pool = HistoricalOpponentPool(
+        _training_output_directory(checkpoint), device, seed=int(rng.integers(2**31 - 1)),
+    )
+    if rng.random() < stage.historical_opponent_probability:
+        snapshot = pool.choose(stage.index)
+        if snapshot is not None:
+            return str(snapshot.path), f"训练历史模型-阶段{snapshot.completed_stage}"
+    return stage.opponent, f"训练脚本-{stage.opponent}"
 
 
 def _new_game(stage, seed: int, rng: np.random.Generator) -> TankGame:
@@ -108,9 +143,19 @@ def watch(args: argparse.Namespace) -> None:
     stage = STAGES[int(stage_index)]
     rng = np.random.default_rng(args.seed)
     player = ModelController(player_model, device, not args.sample_actions)
+    opponent_spec = args.opponent
+    opponent_label = None
+    if args.opponent == "training":
+        opponent_spec, opponent_label = _resolve_training_opponent(
+            stage, args.checkpoint, device, rng,
+        )
     opponent, opponent_name = _opponent_controller(
-        args.opponent, device, rng, not args.sample_actions
+        opponent_spec, device, rng, not args.sample_actions,
+        fire_probability=stage.opponent_fire_probability,
     )
+    if opponent_label is not None:
+        opponent_name = opponent_label if opponent_spec in SCRIPTED_OPPONENTS else opponent_name
+        print(f"观战对手已按训练配置选择：{opponent_name}")
     renderer = PygameRenderer(
         caption=f"蓝方 {args.checkpoint.name}  VS  紫方 {opponent_name}  |  N跳局 Esc退出"
     )
