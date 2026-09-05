@@ -14,7 +14,7 @@ from torch import nn
 
 from .checkpoint import atomic_torch_save
 from .environment import LAYOUTS, SPAWNS, RewardConfig, TankSelfPlayEnv
-from .model import TankActorCritic, load_actor_critic_state
+from .model import TankActorCritic, encode_actions, load_actor_critic_state
 from .observation import BULLET_FEATURES, MAP_CHANNELS, MAP_SIZE, MAX_BULLETS, MAX_OTHER_TANKS, Observation, SELF_FEATURES, TANK_FEATURES
 from .live_plot import try_create_plot
 from .opponents import build_opponent_controller, script_action
@@ -26,8 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=16, help="并行维护的游戏局数")
     parser.add_argument("--rollout-steps", type=int, default=128, help="每次 PPO 更新前收集的决策步数")
     parser.add_argument("--action-repeat", type=int, default=2, help="一个动作保持的 24 Hz 物理帧数")
-    parser.add_argument("--rows", type=int, default=6, help="固定地图行数")
-    parser.add_argument("--cols", type=int, default=6, help="固定地图列数")
+    parser.add_argument("--rows", type=int, default=None, help="固定地图行数；省略则每局随机6..12")
+    parser.add_argument("--cols", type=int, default=None, help="固定地图列数；省略则每局随机6..12")
     parser.add_argument("--layout", choices=LAYOUTS, default="maze", help="maze 为随机迷宫，open 为只有外墙的空场")
     parser.add_argument("--spawn", choices=SPAWNS, default="default", help="坦克出生方式")
     parser.add_argument("--time-limit", type=float, default=90.0, help="每局最多持续的游戏秒数")
@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="势函数塑形强度；用 gamma*Phi(s')-Phi(s)，不会靠反复靠近刷累计奖励",
+    )
+    parser.add_argument(
+        "--opponent-self-kill-reward",
+        type=float,
+        default=0.0,
+        help="对手被自己的反弹弹击毁时给学员的奖励；0 可阻止靠躲避等对手自杀",
     )
     parser.add_argument("--clip-coef", type=float, default=0.2)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
@@ -90,9 +96,12 @@ def stack_observations(observations: list[Observation]) -> dict[str, np.ndarray]
     return {
         "map": np.stack([observation["map"] for observation in observations]).astype(np.uint8),
         "self": np.stack([observation["self"] for observation in observations]).astype(np.float32),
+        "self_pos": np.stack([observation["self_pos"] for observation in observations]).astype(np.float32),
         "tanks": np.stack([observation["tanks"] for observation in observations]).astype(np.float32),
+        "tank_pos": np.stack([observation["tank_pos"] for observation in observations]).astype(np.float32),
         "tank_mask": np.stack([observation["tank_mask"] for observation in observations]).astype(np.float32),
         "bullets": np.stack([observation["bullets"] for observation in observations]).astype(np.float32),
+        "bullet_pos": np.stack([observation["bullet_pos"] for observation in observations]).astype(np.float32),
         "bullet_mask": np.stack([observation["bullet_mask"] for observation in observations]).astype(np.float32),
     }
 
@@ -100,7 +109,10 @@ def stack_observations(observations: list[Observation]) -> dict[str, np.ndarray]
 def _model_batch(batch: dict[str, np.ndarray], device: torch.device, indices: np.ndarray | None = None) -> tuple[torch.Tensor, ...]:
     """把观察批次转到模型设备，可选地切出一个小批量。"""
     tensors = []
-    for key in ("map", "self", "tanks", "tank_mask", "bullets", "bullet_mask"):
+    for key in (
+        "map", "self", "self_pos", "tanks", "tank_pos", "tank_mask",
+        "bullets", "bullet_pos", "bullet_mask",
+    ):
         array = batch[key] if indices is None else batch[key][indices]
         tensors.append(torch.from_numpy(array).to(device))
     return tuple(tensors)
@@ -147,11 +159,11 @@ def train(args: argparse.Namespace) -> Path:
         try:
             load_actor_critic_state(model, checkpoint["model_state"])
         except RuntimeError as error:
-            raise SystemExit("断点模型结构与当前集合编码器不兼容，需要重新训练。") from error
+            raise SystemExit("断点使用旧墙观察/模型结构，不能续训，需要从新版监督模型重新训练。") from error
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         global_step = int(checkpoint.get("global_step", 0))
         saved_config = checkpoint.get("config", {})
-        for name in ("num_envs", "rollout_steps", "action_repeat", "rows", "cols", "layout", "spawn", "time_limit", "epochs", "minibatch_size", "gamma", "gae_lambda", "potential_scale", "clip_coef", "entropy_coef", "teacher_coef", "value_coef", "max_grad_norm", "target_kl", "anneal_lr"):
+        for name in ("num_envs", "rollout_steps", "action_repeat", "rows", "cols", "layout", "spawn", "time_limit", "epochs", "minibatch_size", "gamma", "gae_lambda", "potential_scale", "opponent_self_kill_reward", "clip_coef", "entropy_coef", "teacher_coef", "value_coef", "max_grad_norm", "target_kl", "anneal_lr"):
             if name in saved_config:
                 setattr(args, name, saved_config[name])
         print(f"resumed checkpoint={args.resume} global_step={global_step}")
@@ -162,7 +174,7 @@ def train(args: argparse.Namespace) -> Path:
         try:
             load_actor_critic_state(model, checkpoint["model_state"])
         except RuntimeError as error:
-            raise SystemExit("初始化模型结构与当前集合编码器不兼容，需要重新训练。") from error
+            raise SystemExit("初始化权重使用旧墙观察/模型结构，请改用新版监督 checkpoint。") from error
         print(f"initialized model weights from={args.initialize_from}")
 
     if args.resume is not None:
@@ -197,6 +209,7 @@ def train(args: argparse.Namespace) -> Path:
             reward_config=RewardConfig(
                 potential_scale=args.potential_scale,
                 potential_gamma=args.gamma,
+                opponent_self_kill_win=args.opponent_self_kill_reward,
             ),
         )
         for _ in range(args.num_envs)
@@ -216,10 +229,11 @@ def train(args: argparse.Namespace) -> Path:
     updates = int(np.ceil(remaining_steps / batch_size))
     episode_returns = np.zeros((args.num_envs, TankSelfPlayEnv.num_agents), dtype=np.float32)
     teacher_rng = np.random.default_rng(args.seed + 313)
-    teacher_fire_weight = torch.tensor([1.0, 4.0], device=device)
     recent_returns: deque[float] = deque(maxlen=100)
     recent_results: deque[int] = deque(maxlen=100)  # 1 为分出胜负，0 为平局。
     recent_learner_wins: deque[int] = deque(maxlen=100)
+    recent_active_kills: deque[int] = deque(maxlen=100)
+    recent_passive_wins: deque[int] = deque(maxlen=100)
     recent_matchups: dict[str, deque[int]] = defaultdict(lambda: deque(maxlen=100))
     args.output.mkdir(parents=True, exist_ok=True)
     log_path = args.output / "training_log.csv"
@@ -241,6 +255,7 @@ def train(args: argparse.Namespace) -> Path:
         if not append_log:
             writer.writerow((
                 "update", "global_step", "mean_return_100", "decisive_rate_100", "learner_win_100",
+                "active_kill_100", "passive_win_100",
                 "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "explained_variance",
                 "grad_norm", "teacher_loss", "reverse_rate", "forward_rate", "turn_rate", "fire_action_rate",
                 "learning_rate", "opponent_results_100", "steps_per_second",
@@ -253,9 +268,12 @@ def train(args: argparse.Namespace) -> Path:
             rollout = {
                 "map": np.empty((args.rollout_steps, agents_per_batch, MAP_CHANNELS, MAP_SIZE, MAP_SIZE), dtype=np.uint8),
                 "self": np.empty((args.rollout_steps, agents_per_batch, SELF_FEATURES), dtype=np.float32),
+                "self_pos": np.empty((args.rollout_steps, agents_per_batch, 2), dtype=np.float32),
                 "tanks": np.empty((args.rollout_steps, agents_per_batch, MAX_OTHER_TANKS, TANK_FEATURES), dtype=np.float32),
+                "tank_pos": np.empty((args.rollout_steps, agents_per_batch, MAX_OTHER_TANKS, 2), dtype=np.float32),
                 "tank_mask": np.empty((args.rollout_steps, agents_per_batch, MAX_OTHER_TANKS), dtype=np.float32),
                 "bullets": np.empty((args.rollout_steps, agents_per_batch, MAX_BULLETS, BULLET_FEATURES), dtype=np.float32),
+                "bullet_pos": np.empty((args.rollout_steps, agents_per_batch, MAX_BULLETS, 2), dtype=np.float32),
                 "bullet_mask": np.empty((args.rollout_steps, agents_per_batch, MAX_BULLETS), dtype=np.float32),
             }
             actions = np.empty((args.rollout_steps, agents_per_batch, 3), dtype=np.int64)
@@ -337,6 +355,16 @@ def train(args: argparse.Namespace) -> Path:
                             recent_returns.append(float(episode_returns[env_index, slot]))
                             learner_won = int(info["winner"] == env.agent_ids[slot])
                             recent_learner_wins.append(learner_won)
+                            death_shooter = {
+                                event["victim"]: event["shooter"]
+                                for event in info.get("events", [])
+                            }
+                            defeated = env.agent_ids[1 - slot]
+                            active_kill = int(
+                                learner_won and death_shooter.get(defeated) == env.agent_ids[slot]
+                            )
+                            recent_active_kills.append(active_kill)
+                            recent_passive_wins.append(int(learner_won and not active_kill))
                             label = opponent.current_label(env_index)
                             outcome = 1 if learner_won else (0 if info["winner"] is None else -1)
                             recent_matchups[label].append(outcome)
@@ -404,17 +432,13 @@ def train(args: argparse.Namespace) -> Path:
                     entropy_mean = entropy.mean()
                     teacher_loss = torch.zeros((), device=device)
                     if flat_teacher_actions is not None:
-                        throttle_logits, steer_logits, fire_logits, _ = model.action_logits(
-                            *_model_batch(flat_batch, device, batch_indices)
-                        )
+                        teacher_logits, _ = model.action_logits(*_model_batch(flat_batch, device, batch_indices))
                         teacher_target = torch.from_numpy(flat_teacher_actions[batch_indices]).to(device)
-                        teacher_loss = (
-                            nn.functional.cross_entropy(throttle_logits, teacher_target[:, 0])
-                            + nn.functional.cross_entropy(steer_logits, teacher_target[:, 1])
-                            + nn.functional.cross_entropy(
-                                fire_logits, teacher_target[:, 2], weight=teacher_fire_weight
-                            )
-                        ) / 3.0
+                        joint_target = encode_actions(teacher_target)
+                        per_sample = nn.functional.cross_entropy(teacher_logits, joint_target, reduction="none")
+                        teacher_loss = (per_sample * torch.where(
+                            teacher_target[:, 2] == 1, 4.0, 1.0
+                        )).mean()
                     teacher_weight = args.teacher_coef * (
                         optimizer.param_groups[0]["lr"] / max(args.learning_rate, 1e-12)
                     )
@@ -447,6 +471,8 @@ def train(args: argparse.Namespace) -> Path:
             mean_return = float(np.mean(recent_returns)) if recent_returns else float("nan")
             decisive_rate = float(np.mean(recent_results)) if recent_results else float("nan")
             learner_win = float(np.mean(recent_learner_wins)) if recent_learner_wins else float("nan")
+            active_kill_rate = float(np.mean(recent_active_kills)) if recent_active_kills else float("nan")
+            passive_win_rate = float(np.mean(recent_passive_wins)) if recent_passive_wins else float("nan")
             fire_action_rate = float((flat_actions[:, 2] == 1).mean())
             reverse_rate = float((flat_actions[:, 0] == 0).mean())
             forward_rate = float((flat_actions[:, 0] == 2).mean())
@@ -467,14 +493,16 @@ def train(args: argparse.Namespace) -> Path:
             steps_per_second = int(run_steps / elapsed)
             print(
                 f"update={update}/{updates} step={global_step} return100={mean_return:.3f} "
-                f"decisive100={decisive_rate:.2f} win100={learner_win:.2f} policy={mean_metrics[0]:.4f} "
+                f"decisive100={decisive_rate:.2f} win100={learner_win:.2f} "
+                f"active100={active_kill_rate:.2f} passive100={passive_win_rate:.2f} "
+                f"policy={mean_metrics[0]:.4f} "
                 f"value={mean_metrics[1]:.4f} entropy={mean_metrics[2]:.4f} "
                 f"kl={mean_metrics[3]:.5f} clip={mean_metrics[4]:.3f} ev={explained_variance:.3f} "
                 f"teacher={mean_metrics[6]:.3f} "
                 f"fire_rate={fire_action_rate:.3f} pool=[{matchup_text}] sps={steps_per_second}"
             )
             writer.writerow((
-                update, global_step, mean_return, decisive_rate, learner_win,
+                update, global_step, mean_return, decisive_rate, learner_win, active_kill_rate, passive_win_rate,
                 mean_metrics[0], mean_metrics[1], mean_metrics[2], mean_metrics[3], mean_metrics[4],
                 explained_variance, mean_metrics[5], mean_metrics[6], reverse_rate, forward_rate, turn_rate, fire_action_rate,
                 optimizer.param_groups[0]["lr"], json.dumps(matchup_summary, ensure_ascii=False), steps_per_second,

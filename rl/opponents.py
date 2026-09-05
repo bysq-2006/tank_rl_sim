@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import math
+import weakref
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from core import TankGame
-from core.entities import Tank
+from core.entities import Bullet, Tank
 from core.geometry import segment_intersects_rect
 
 from .model import TankActorCritic, load_actor_critic_state
 from .observation import Observation
 from .planning import astar_path, tank_cell
+from .trajectory import PathSegment, trace_bullet_trajectory
 
 SCRIPT_NAMES = ("idle", "move", "random", "aim", "chase", "dodge", "hunter")
 OPPONENT_CHOICES = ("self", "mix", "model") + SCRIPT_NAMES
+_RICOCHET_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _wrap_angle(error: float) -> float:
@@ -98,50 +101,225 @@ def _drive_toward(tank: Tank, x: float, y: float, deadzone: float = 0.18) -> tup
     return throttle, steer
 
 
-def _incoming_bullet(game: TankGame, tank: Tank) -> tuple[float, float] | None:
-    """最近一发朝自己飞来的敌弹速度；没有则 None。"""
-    closest = None
-    best = None
+def _hypothetical_shot(game: TankGame, tank: Tank, heading: float) -> Bullet:
+    """按真实出膛位置和速度构造一颗不写入游戏状态的子弹。"""
+    direction_x, direction_y = math.cos(heading), math.sin(heading)
+    offset = game.tank_half_length + game.bullet_radius + 0.04
+    return Bullet(
+        tank.x + direction_x * offset,
+        tank.y + direction_y * offset,
+        direction_x * game.bullet_speed,
+        direction_y * game.bullet_speed,
+        owner_tank_id=tank.tank_id,
+    )
+
+
+def _shot_hits_enemy(game: TankGame, tank: Tank, enemy: Tank, heading: float) -> bool:
+    """真实墙体反射弹道上的首个目标是否为敌人。"""
+    result = trace_bullet_trajectory(
+        game,
+        _hypothetical_shot(game, tank, heading),
+        tank.tank_id,
+        max_seconds=6.0,
+    )
+    return result.predicted_hit == enemy.tank_id
+
+
+def _ricochet_heading(game: TankGame, tank: Tank, enemy: Tank) -> float | None:
+    """用镜像目标产生一反候选，再以完整弹道模拟验证（验证时允许继续多次反弹）。"""
+    game_cache = _RICOCHET_CACHE.setdefault(game, {})
+    cached = game_cache.get(tank.tank_id)
+    if cached is not None:
+        cached_maze_id, cached_time, cached_tank_xy, cached_enemy_xy, cached_heading = cached
+        if (
+            cached_maze_id == id(game.maze)
+            and game.elapsed >= cached_time
+            and game.elapsed - cached_time < 0.18
+            and math.hypot(tank.x - cached_tank_xy[0], tank.y - cached_tank_xy[1]) < 0.3
+            and math.hypot(enemy.x - cached_enemy_xy[0], enemy.y - cached_enemy_xy[1]) < 0.3
+        ):
+            return cached_heading
+
+    candidates: list[tuple[float, float]] = []
+    radius = game.bullet_radius
+    for x0, y0, x1, y1 in game.wall_rects:
+        for surface in (x0 - radius, x1 + radius):
+            mirror_x = 2.0 * surface - enemy.x
+            denominator = mirror_x - tank.x
+            if abs(denominator) > 1e-8:
+                fraction = (surface - tank.x) / denominator
+                cross_y = tank.y + fraction * (enemy.y - tank.y)
+                if 0.0 < fraction < 1.0 and y0 - radius <= cross_y <= y1 + radius:
+                    candidates.append((
+                        math.atan2(enemy.y - tank.y, mirror_x - tank.x),
+                        math.hypot(mirror_x - tank.x, enemy.y - tank.y) / game.bullet_speed + 0.15,
+                    ))
+        for surface in (y0 - radius, y1 + radius):
+            mirror_y = 2.0 * surface - enemy.y
+            denominator = mirror_y - tank.y
+            if abs(denominator) > 1e-8:
+                fraction = (surface - tank.y) / denominator
+                cross_x = tank.x + fraction * (enemy.x - tank.x)
+                if 0.0 < fraction < 1.0 and x0 - radius <= cross_x <= x1 + radius:
+                    candidates.append((
+                        math.atan2(mirror_y - tank.y, enemy.x - tank.x),
+                        math.hypot(enemy.x - tank.x, mirror_y - tank.y) / game.bullet_speed + 0.15,
+                    ))
+
+    # 优先选择当前炮口转角小的解；角度量化只用于去掉同一墙面产生的重复候选。
+    unique: dict[int, tuple[float, float]] = {}
+    for heading, duration in candidates:
+        unique.setdefault(round(_wrap_angle(heading) * 10000), (heading, duration))
+    result_heading = None
+    ordered = sorted(unique.values(), key=lambda value: abs(_wrap_angle(value[0] - tank.heading)))
+    for heading, duration in ordered[:8]:
+        result = trace_bullet_trajectory(
+            game,
+            _hypothetical_shot(game, tank, heading),
+            tank.tank_id,
+            max_seconds=min(duration, 6.0),
+        )
+        if result.predicted_hit == enemy.tank_id:
+            result_heading = heading
+            break
+    game_cache[tank.tank_id] = (
+        id(game.maze),
+        game.elapsed,
+        (tank.x, tank.y),
+        (enemy.x, enemy.y),
+        result_heading,
+    )
+    return result_heading
+
+
+def _segment_position(segments: tuple[PathSegment, ...], time_s: float) -> tuple[float, float] | None:
+    """读取预演弹道在未来某时刻的位置。"""
+    for segment in segments:
+        if segment.time0 <= time_s <= segment.time1 + 1e-9:
+            fraction = (time_s - segment.time0) / max(segment.time1 - segment.time0, 1e-9)
+            fraction = min(max(fraction, 0.0), 1.0)
+            return (
+                segment.x0 + (segment.x1 - segment.x0) * fraction,
+                segment.y0 + (segment.y1 - segment.y0) * fraction,
+            )
+    return None
+
+
+def _simulate_escape(
+    game: TankGame,
+    tank: Tank,
+    throttle: int,
+    steer: int,
+    trajectories: list[tuple[Bullet, tuple[PathSegment, ...]]],
+    horizon: float,
+) -> tuple[float, float, int]:
+    """用与核心相同的加速/转向近似预测一个恒定动作的安全余量。"""
+    x, y, heading, speed = tank.x, tank.y, tank.heading, tank.speed
+    minimum_distance = math.inf
+    wall_contacts = 0
+    steps = max(1, int(math.ceil(horizon / game.dt)))
+    target_speed = (throttle - 1) * game.max_speed
+    angular_velocity = (steer - 1) * game.max_turn_rate
+    for step in range(1, steps + 1):
+        change = float(np.clip(target_speed - speed, -game.acceleration * game.dt, game.acceleration * game.dt))
+        speed += change
+        if throttle == 1:
+            speed *= max(0.0, 1.0 - game.drag * game.dt)
+        heading = (heading + angular_velocity * game.dt) % (2.0 * math.pi)
+        nx = x + math.cos(heading) * speed * game.dt
+        if not game._tank_hits_wall(nx, y, heading):
+            x = nx
+        else:
+            speed *= 0.25
+            wall_contacts += 1
+        ny = y + math.sin(heading) * speed * game.dt
+        if not game._tank_hits_wall(x, ny, heading):
+            y = ny
+        else:
+            speed *= 0.25
+            wall_contacts += 1
+        time_s = step * game.dt
+        for bullet, segments in trajectories:
+            if bullet.age + time_s < 0.08:
+                continue
+            position = _segment_position(segments, time_s)
+            if position is not None:
+                minimum_distance = min(minimum_distance, math.hypot(x - position[0], y - position[1]))
+    displacement = math.hypot(x - tank.x, y - tank.y)
+    return minimum_distance, displacement, wall_contacts
+
+
+def _best_dodge_action(game: TankGame, tank: Tank) -> tuple[int, int] | None:
+    """综合所有当前及反弹后的子弹，选择未来1.25秒内最安全的油门/转向。"""
+    horizon = 1.25
+    trajectories: list[tuple[Bullet, tuple[PathSegment, ...]]] = []
     for bullet in game.bullets:
-        if bullet.owner_tank_id == tank.tank_id:
+        if math.hypot(bullet.x - tank.x, bullet.y - tank.y) > game.bullet_speed * horizon + 1.5:
             continue
-        dx, dy = tank.x - bullet.x, tank.y - bullet.y
-        distance = math.hypot(dx, dy)
-        speed = math.hypot(bullet.vx, bullet.vy)
-        if distance < 1e-6 or speed < 1e-6:
-            continue
-        approaching = (bullet.vx * dx + bullet.vy * dy) / (speed * distance)
-        if approaching <= 0.15:
-            continue
-        if closest is None or distance < closest:
-            closest = distance
-            best = (bullet.vx, bullet.vy, dx, dy, distance)
-    if best is None:
+        result = trace_bullet_trajectory(game, bullet, bullet.owner_tank_id, max_seconds=horizon)
+        trajectories.append((bullet, result.segments))
+    if not trajectories:
         return None
-    vx, vy, dx, dy, _distance = best
-    px, py = -vy, vx
-    # 侧移方向取远离子弹轨迹的那一侧。
-    if px * dx + py * dy < 0:
-        px, py = -px, -py
-    return px, py
+
+    collision_radius = math.hypot(game.tank_half_length, game.tank_half_width) + game.bullet_radius
+    neutral = _simulate_escape(game, tank, 1, 1, trajectories, horizon)
+    if neutral[0] > collision_radius + 0.32:
+        return None
+
+    best_action = (1, 1)
+    best_score = -math.inf
+    for throttle in (0, 1, 2):
+        for steer in (0, 1, 2):
+            distance, displacement, contacts = _simulate_escape(
+                game, tank, throttle, steer, trajectories, horizon
+            )
+            # 首要目标是拉大与所有未来弹道的最小距离；随后才偏好确实移动且不撞墙。
+            score = distance + 0.04 * displacement - 0.08 * contacts
+            if score > best_score:
+                best_score = score
+                best_action = (throttle, steer)
+    return best_action
+
+
+def _fire_for_action(
+    game: TankGame,
+    tank: Tank,
+    enemy: Tank,
+    steer: int,
+    has_los: bool,
+    shot_heading: float | None,
+) -> int:
+    """按核心“先转一物理帧、再开火”的顺序判断本动作是否应开火。"""
+    if shot_heading is None or tank.cooldown > game.dt + 1e-6:
+        return 0
+    firing_heading = (tank.heading + (steer - 1) * game.max_turn_rate * game.dt) % (2.0 * math.pi)
+    if has_los:
+        # 直射保留少量容差，避免离散转向每决策步跨过瞄准点后永远不开火。
+        direct_heading = math.atan2(enemy.y - tank.y, enemy.x - tank.x)
+        return int(abs(_wrap_angle(direct_heading - firing_heading)) < 0.14)
+    # 反弹射击不猜：预演从下一物理帧朝向发射的子弹，确认首个命中敌人才开火。
+    return int(_shot_hits_enemy(game, tank, enemy, firing_heading))
 
 
 def _hunter_action(game: TankGame, tank: Tank, enemy: Tank, rng: np.random.Generator) -> tuple[int, int, int]:
-    """A* 绕墙靠近，看见敌人就瞄准开火；有敌弹飞来则侧移或后退。"""
+    """A* 寻路、验证直射/反弹弹道，并通过短时动作模拟躲避多颗子弹。"""
     del rng
-    aim_error = _aim_error(tank, enemy)
-    fire = int(_has_los(game, tank, enemy) and abs(aim_error) < 0.14)
-    dodge = _incoming_bullet(game, tank)
+    direct_heading = math.atan2(enemy.y - tank.y, enemy.x - tank.x)
+    has_los = _has_los(game, tank, enemy)
+    shot_heading = direct_heading if has_los else _ricochet_heading(game, tank, enemy)
+    aim_error = _wrap_angle((shot_heading if shot_heading is not None else direct_heading) - tank.heading)
+    dodge = _best_dodge_action(game, tank)
     if dodge is not None:
-        px, py = dodge
-        error = _wrap_angle(math.atan2(py, px) - tank.heading)
-        if abs(error) > 2.2:
-            return (0, _steer_toward(_wrap_angle(error - math.pi), deadzone=0.25), fire)
-        throttle = 2 if abs(error) < 0.7 else 1
-        return (throttle, _steer_toward(error, deadzone=0.2), fire)
-    if _has_los(game, tank, enemy):
+        fire = _fire_for_action(game, tank, enemy, dodge[1], has_los, shot_heading)
+        return (dodge[0], dodge[1], fire)
+    if shot_heading is not None:
         distance = math.hypot(enemy.x - tank.x, enemy.y - tank.y)
-        steer = _steer_toward(aim_error)
+        steer = _steer_toward(aim_error, deadzone=0.025)
+        fire = _fire_for_action(game, tank, enemy, steer, has_los, shot_heading)
+        if not has_los:
+            # 若离散转向跨不过精确反弹角，缓慢改变射击几何，不能原地形成“不转也不开火”的死锁。
+            throttle = 1 if fire or abs(aim_error) > 0.16 else 2
+            return (throttle, steer, fire)
         if distance < 1.6:
             throttle = 0
         elif distance > 3.2 and abs(aim_error) < 0.6:
@@ -151,7 +329,9 @@ def _hunter_action(game: TankGame, tank: Tank, enemy: Tank, rng: np.random.Gener
         return (throttle, steer, fire)
     path = astar_path(game.maze, tank_cell(tank, game.maze), tank_cell(enemy, game.maze))
     if len(path) <= 1:
-        return (1, _steer_toward(aim_error), fire)
+        steer = _steer_toward(aim_error, deadzone=0.025)
+        fire = _fire_for_action(game, tank, enemy, steer, has_los, shot_heading)
+        return (2, steer, fire)
     next_row, next_col = path[1]
     throttle, steer = _drive_toward(tank, next_col + 0.5, next_row + 0.5)
     return (throttle, steer, 0)
@@ -347,7 +527,7 @@ def load_opponent_model(path: Path, device: torch.device) -> TankActorCritic:
     try:
         load_actor_critic_state(model, checkpoint["model_state"])
     except RuntimeError as error:
-        raise SystemExit("对手模型结构与当前集合编码器不兼容。") from error
+        raise SystemExit("对手模型使用旧墙观察/模型结构，不能放入当前对手池。") from error
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)

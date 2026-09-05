@@ -18,8 +18,8 @@ def parse_args() -> argparse.Namespace:
     """观看人机对打，或监督模型对人机。"""
     parser = argparse.ArgumentParser(description="Watch hunter vs hunter, or a cloned model vs hunter.")
     parser.add_argument("--checkpoint", type=str, default=None, help="省略则双方都是人机")
-    parser.add_argument("--rows", type=int, default=6)
-    parser.add_argument("--cols", type=int, default=6)
+    parser.add_argument("--rows", type=int, default=None)
+    parser.add_argument("--cols", type=int, default=None)
     parser.add_argument("--layout", choices=("maze", "open"), default="maze")
     parser.add_argument("--spawn", choices=("default", "close_facing", "far_random"), default="default")
     parser.add_argument("--time-limit", type=float, default=90.0)

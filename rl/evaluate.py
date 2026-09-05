@@ -148,7 +148,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, int]:
 
         renderer = PygameRenderer(hud_rows=1)
 
-    results = {"learner": 0, "opponent": 0, "tank_0": 0, "tank_1": 0, "draw": 0, "skip": 0}
+    results = {
+        "learner": 0, "opponent": 0, "tank_0": 0, "tank_1": 0, "draw": 0, "skip": 0,
+        "active_kill": 0, "opponent_self_kill": 0, "learner_self_kill": 0,
+        "opponent_kill": 0, "simultaneous_death": 0, "timeout": 0,
+    }
+    learner_decisions = np.zeros(4, dtype=np.int64)  # 总步数、后退、前进、开火命令。
     abort = False
     try:
         for game_index in range(args.games):
@@ -166,6 +171,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, int]:
             done = False
             skipped = False
             info: dict[str, object] = {"winner": None}
+            episode_events: list[dict] = []
             while not done:
                 if renderer is not None:
                     control = renderer.poll_control()
@@ -193,6 +199,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, int]:
                     joint[learner_slot] = learner_action.cpu().numpy()[0]
                     joint[other] = opponent.action(0, env.game, env.agent_ids[other], observations[other])
                 observations, _, done, info = env.step(joint)
+                episode_events.extend(info.get("events", []))
+                if opponent is not None:
+                    learner_choice = joint[learner_slot]
+                    learner_decisions += (
+                        1,
+                        int(learner_choice[0] == 0),
+                        int(learner_choice[0] == 2),
+                        int(learner_choice[2] == 1),
+                    )
                 if renderer is not None:
                     renderer.draw(env.game, hud)
                     renderer.tick(max(1, env.game.physics_hz // action_repeat))
@@ -208,8 +223,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, int]:
                 winner = info["winner"]
                 key = "draw" if winner is None else f"tank_{winner}"
                 results[key] += 1
+                death_shooter = {event["victim"]: event["shooter"] for event in episode_events}
                 if winner is None:
                     stats["draw"] += 1
+                    if episode_events:
+                        results["simultaneous_death"] += 1
+                    else:
+                        results["timeout"] += 1
                     outcome = "平"
                 elif opponent is None:
                     if winner == env.agent_ids[0]:
@@ -223,10 +243,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, int]:
                 elif winner == env.agent_ids[learner_slot]:
                     stats["win"] += 1
                     results["learner"] += 1
+                    defeated = env.agent_ids[1 - learner_slot]
+                    if death_shooter.get(defeated) == env.agent_ids[learner_slot]:
+                        results["active_kill"] += 1
+                    else:
+                        results["opponent_self_kill"] += 1
                     outcome = "学员胜"
                 else:
                     stats["lose"] += 1
                     results["opponent"] += 1
+                    defeated = env.agent_ids[learner_slot]
+                    if death_shooter.get(defeated) == defeated:
+                        results["learner_self_kill"] += 1
+                    else:
+                        results["opponent_kill"] += 1
                     outcome = "对手胜"
                 print(
                     f"game={game_index + 1}/{args.games} vs={opponent_display_name(current_label)} "
@@ -252,6 +282,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, int]:
         print(
             f"  vs {opponent_display_name(label)}: "
             f"{learner_name} {stats['win']}-{stats['lose']} 对手  平{stats['draw']} 跳{stats['skip']}{interval}"
+        )
+    if opponent is not None:
+        decisions = max(int(learner_decisions[0]), 1)
+        print(
+            "胜负来源: "
+            f"主动击杀{results['active_kill']} 对手自杀送胜{results['opponent_self_kill']} "
+            f"自己误杀{results['learner_self_kill']} 被对手击杀{results['opponent_kill']} "
+            f"同归于尽{results['simultaneous_death']} 超时{results['timeout']}"
+        )
+        print(
+            "学员动作: "
+            f"后退{learner_decisions[1] / decisions:.1%} "
+            f"前进{learner_decisions[2] / decisions:.1%} "
+            f"开火命令{learner_decisions[3] / decisions:.1%}"
         )
     return results
 

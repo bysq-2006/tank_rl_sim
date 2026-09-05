@@ -9,7 +9,7 @@ from rl.evaluate import evaluate as rl_evaluate
 def parse_args() -> argparse.Namespace:
     """评估监督模型；默认对人机。"""
     parser = argparse.ArgumentParser(description="Evaluate a cloned hunter policy.")
-    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/hunter_bc/latest.pt"))
+    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/hunter_bc_exact_v4/latest.pt"))
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--rows", type=int, default=None)

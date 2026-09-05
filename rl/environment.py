@@ -35,6 +35,7 @@ class RewardConfig:
     loss: float = -1.0  # 被敌人击毁。
     self_kill: float = -1.0  # 被自己的子弹击毁。
     timeout: float = -1.0  # 超时双方惩罚。
+    opponent_self_kill_win: float = 1.0  # 对手自杀时幸存者的奖励；专项训练可设为 0 以切断被动等死捷径。
     potential_scale: float = 0.0  # 训练时建议 0.2；评估环境保持 0。
     potential_gamma: float = 0.995  # 必须与 PPO 的决策步 gamma 一致。
 
@@ -131,9 +132,11 @@ class TankSelfPlayEnv:
                     for index, tank_id in enumerate(self.agent_ids):
                         rewards[index] += config.self_kill if death_shooter.get(tank_id) == tank_id else config.loss
             else:
+                loser_ids = [tank_id for tank_id in self.agent_ids if tank_id != self.game.winner]
+                opponent_self_killed = any(death_shooter.get(tank_id) == tank_id for tank_id in loser_ids)
                 for index, tank_id in enumerate(self.agent_ids):
                     if tank_id == self.game.winner:
-                        rewards[index] += config.win
+                        rewards[index] += config.opponent_self_kill_win if opponent_self_killed else config.win
                     elif death_shooter.get(tank_id) == tank_id:
                         rewards[index] += config.self_kill
                     else:

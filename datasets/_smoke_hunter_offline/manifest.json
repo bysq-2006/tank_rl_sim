@@ -1,0 +1,63 @@
+{
+  "format_version": 1,
+  "observation_spec": {
+    "map": [
+      2,
+      48,
+      48
+    ],
+    "self": [
+      20
+    ],
+    "tanks": [
+      7,
+      8
+    ],
+    "tank_mask": [
+      7
+    ],
+    "bullets": [
+      40,
+      7
+    ],
+    "bullet_mask": [
+      40
+    ],
+    "action": [
+      3
+    ]
+  },
+  "game": {
+    "action_repeat": 2,
+    "rows": 6,
+    "cols": 6,
+    "layout": "maze",
+    "spawn": "default",
+    "time_limit": 2.0
+  },
+  "splits": {
+    "train": {
+      "seeds": [
+        91000,
+        91001,
+        91002,
+        91003
+      ],
+      "shards": [
+        "train/shard_00000.npz",
+        "train/shard_00001.npz"
+      ],
+      "samples": 192
+    },
+    "validation": {
+      "seeds": [
+        91004,
+        91005
+      ],
+      "shards": [
+        "validation/shard_00000.npz"
+      ],
+      "samples": 96
+    }
+  }
+}

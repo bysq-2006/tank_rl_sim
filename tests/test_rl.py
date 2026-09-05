@@ -1,4 +1,5 @@
 import math
+from argparse import Namespace
 
 import numpy as np
 import torch
@@ -6,11 +7,15 @@ import torch
 from core import TankGame
 from core.entities import Bullet
 from rl.environment import RewardConfig, TankSelfPlayEnv
-from rl.model import TankActorCritic, load_actor_critic_state
+from rl.model import TankActorCritic, decode_actions, encode_actions, load_actor_critic_state
 from rl.observation import BULLET_FEATURES, MAP_CHANNELS, MAP_SIZE, MAX_BULLETS, MAX_OTHER_TANKS, SELF_FEATURES, TANK_FEATURES, build_observation
+from rl.train import _model_batch, stack_observations
 from rl.planning import astar_distance, tank_cell
 from rl.trajectory import proximity_score, trace_bullet_trajectory
 from supervised.teachers import HunterTeacher
+from supervised.collect import collect as collect_supervised_dataset
+from supervised.dataset import load_manifest, load_shard, split_shards
+from supervised.train_offline import train as train_offline_bc
 
 
 def make_open_arena(game: TankGame, rows: int = 6, cols: int = 6) -> None:
@@ -26,18 +31,25 @@ def test_observation_has_fixed_shapes_for_different_maps():
         observation = build_observation(game, tank_id=0)
         assert observation["map"].shape == (MAP_CHANNELS, MAP_SIZE, MAP_SIZE)
         assert observation["self"].shape == (SELF_FEATURES,)
+        assert observation["self_pos"].shape == (2,)
         assert observation["tanks"].shape == (MAX_OTHER_TANKS, TANK_FEATURES)
+        assert observation["tank_pos"].shape == (MAX_OTHER_TANKS, 2)
         assert observation["bullets"].shape == (MAX_BULLETS, BULLET_FEATURES)
+        assert observation["bullet_pos"].shape == (MAX_BULLETS, 2)
         assert observation["tank_mask"].shape == (MAX_OTHER_TANKS,)
         assert observation["bullet_mask"].shape == (MAX_BULLETS,)
 
 
-def test_observation_map_is_single_local_wall_channel():
+def test_observation_map_is_exact_padded_wall_topology():
     game = TankGame(rows=6, cols=6)
     observation = build_observation(game, tank_id=0)
-    assert MAP_CHANNELS == 1
-    assert observation["map"].shape == (1, MAP_SIZE, MAP_SIZE)
+    assert MAP_CHANNELS == 5
+    assert observation["map"].shape == (5, MAP_SIZE, MAP_SIZE)
     assert observation["map"].max() <= 1.0
+    assert observation["map"][4, :6, :6].sum() == 36
+    assert observation["map"][4, 6:, :].sum() == 0
+    assert np.array_equal(observation["map"][0, :6, :6], game.maze.horizontal[:6])
+    assert np.array_equal(observation["map"][3, :6, :6], game.maze.vertical[:, :6])
 
 
 def test_bullet_set_marks_enemy_shot_and_ignores_empty_slots():
@@ -47,6 +59,16 @@ def test_bullet_set_marks_enemy_shot_and_ignores_empty_slots():
     assert observation["bullet_mask"].sum() == 1
     assert observation["bullets"][0, 6] == -1.0
     assert observation["bullets"][1:].sum() == 0
+
+
+def test_bullet_position_keeps_subcell_precision():
+    game = TankGame(rows=6, cols=6)
+    enemy = game.tanks[1]
+    game.bullets = [Bullet(2.125, 3.875, 1.0, 0.0, enemy.tank_id)]
+    observation = build_observation(game, tank_id=0)
+    assert np.isclose(observation["bullets"][0, 7], 0.125)
+    assert np.isclose(observation["bullets"][0, 8], 0.875)
+    assert np.allclose(observation["bullet_pos"][0], (2 * 2.125 / 12 - 1, 2 * 3.875 / 12 - 1))
 
 
 def test_observation_encodes_extra_tanks_without_changing_shapes():
@@ -120,6 +142,23 @@ def test_own_bullet_kill_uses_small_self_kill_penalty():
     assert np.isclose(rewards[1], RewardConfig().win)
 
 
+def test_opponent_self_kill_can_give_no_passive_win_reward():
+    env = TankSelfPlayEnv(
+        action_repeat=1,
+        reward_config=RewardConfig(opponent_self_kill_win=0.0),
+    )
+    env.reset(seed=8)
+    victim = env.game.tanks[0]
+    env.game.bullets.append(
+        Bullet(victim.x, victim.y, 0.0, 0.0, owner_tank_id=victim.tank_id, age=1.0)
+    )
+    _, rewards, done, info = env.step([(1, 1, 0), (1, 1, 0)])
+    assert done is True
+    assert info["winner"] == 1
+    assert np.isclose(rewards[0], RewardConfig().self_kill)
+    assert np.isclose(rewards[1], 0.0)
+
+
 def test_timeout_is_worse_than_waiting_without_terminal_result():
     env = TankSelfPlayEnv(action_repeat=1, time_limit=1.0 / 24.0)
     env.reset(seed=5)
@@ -168,6 +207,21 @@ def test_hunter_fires_when_facing_with_line_of_sight():
     second.x, second.y = 4.0, 3.0
     _throttle, steer, fire = script_action(env.game, first.tank_id, "hunter", np.random.default_rng(0))
     assert steer == 1
+    assert fire == 1
+
+
+def test_hunter_has_no_aiming_deadzone_wider_than_its_fire_window():
+    from rl.opponents import script_action
+
+    env = TankSelfPlayEnv(layout="open", spawn="close_facing", rows=6, cols=6)
+    env.reset(seed=11)
+    first, second = env.game.tanks
+    first.x, first.y, first.heading = 1.0, 3.0, 0.08
+    second.x, second.y = 5.0, 3.0
+    _throttle, steer, fire = script_action(
+        env.game, first.tank_id, "hunter", np.random.default_rng(0)
+    )
+    assert steer == 0
     assert fire == 1
 
 
@@ -242,6 +296,36 @@ def test_hunter_teacher_does_not_fire_through_blocking_wall():
     assert fire == 0
 
 
+def test_hunter_teacher_can_aim_and_fire_a_verified_ricochet():
+    from rl.opponents import _has_los, _ricochet_heading
+
+    game = TankGame(rows=6, cols=6)
+    make_open_arena(game)
+    # 近处横墙挡住直射；右边界仍提供一条可验证的一次反弹弹道。
+    game.maze.horizontal[2, 0] = True
+    game.wall_rects = game.maze.wall_rects(game.wall_thickness)
+    own, enemy = game.tanks
+    own.x, own.y = 1.0, 3.0
+    enemy.x, enemy.y = 1.0, 1.0
+    assert not _has_los(game, own, enemy)
+    heading = _ricochet_heading(game, own, enemy)
+    assert heading is not None
+    own.heading = heading
+    throttle, steer, fire = HunterTeacher().action(game, own.tank_id)
+    assert (throttle, steer, fire) == (1, 1, 1)
+
+
+def test_hunter_dodges_a_future_direct_bullet_path():
+    game = TankGame(rows=6, cols=6)
+    make_open_arena(game)
+    own, enemy = game.tanks
+    own.x, own.y, own.heading = 3.0, 3.0, 0.0
+    enemy.x, enemy.y = 5.0, 5.0
+    game.bullets.append(Bullet(1.0, 3.0, game.bullet_speed, 0.0, enemy.tank_id))
+    throttle, steer, _fire = HunterTeacher().action(game, own.tank_id)
+    assert (throttle, steer) != (1, 1)
+
+
 def test_trajectory_predicts_direct_enemy_hit():
     game = TankGame(rows=6, cols=6)
     make_open_arena(game)
@@ -278,15 +362,9 @@ def test_environment_rejects_wrong_action_shape():
 
 def test_model_outputs_three_valid_actions_and_values():
     model = TankActorCritic()
-    maps = torch.randn((2, MAP_CHANNELS, MAP_SIZE, MAP_SIZE))
-    selves = torch.randn((2, SELF_FEATURES))
-    tanks = torch.randn((2, MAX_OTHER_TANKS, TANK_FEATURES))
-    tank_mask = torch.ones((2, MAX_OTHER_TANKS))
-    bullets = torch.randn((2, MAX_BULLETS, BULLET_FEATURES))
-    bullet_mask = torch.ones((2, MAX_BULLETS))
-    actions, log_probability, entropy, value = model.get_action_and_value(
-        maps, selves, tanks, tank_mask, bullets, bullet_mask
-    )
+    game = TankGame(rows=6, cols=12)
+    batch = stack_observations([build_observation(game, 0), build_observation(game, 1)])
+    actions, log_probability, entropy, value = model.get_action_and_value(*_model_batch(batch, torch.device("cpu")))
     assert actions.shape == (2, 3)
     assert log_probability.shape == (2,)
     assert entropy.shape == (2,)
@@ -296,14 +374,89 @@ def test_model_outputs_three_valid_actions_and_values():
     assert torch.all((0 <= actions[:, 2]) & (actions[:, 2] <= 1))
 
 
-def test_old_mean_pooling_checkpoint_initializes_attention_as_uniform():
+def test_model_stays_near_the_intended_small_size():
+    parameters = sum(parameter.numel() for parameter in TankActorCritic().parameters())
+    assert 100_000 <= parameters <= 150_000
+
+
+def test_joint_action_encoding_round_trip():
+    actions = torch.tensor([[0, 0, 0], [1, 2, 1], [2, 2, 1]])
+    assert torch.equal(decode_actions(encode_actions(actions)), actions)
+
+
+def test_old_model_checkpoint_is_rejected():
     source = TankActorCritic()
-    old_state = {
-        key: value
-        for key, value in source.state_dict().items()
-        if not key.startswith(("tank_attention.", "bullet_attention."))
-    }
+    old_state = dict(source.state_dict())
+    old_state.pop("policy_head.weight")
     restored = TankActorCritic()
-    load_actor_critic_state(restored, old_state)
-    assert torch.count_nonzero(restored.tank_attention.weight) == 0
-    assert torch.count_nonzero(restored.bullet_attention.weight) == 0
+    with np.testing.assert_raises(RuntimeError):
+        load_actor_critic_state(restored, old_state)
+
+
+def test_offline_dataset_keeps_complete_map_seeds_in_disjoint_splits(tmp_path):
+    dataset_dir = tmp_path / "dataset"
+    collect_supervised_dataset(
+        Namespace(
+            output=dataset_dir,
+            train_seeds=2,
+            validation_seeds=1,
+            seed_start=700,
+            episodes_per_shard=1,
+            action_repeat=1,
+            rows=6,
+            cols=6,
+            layout="maze",
+            spawn="default",
+            time_limit=1.0 / 24.0,
+        )
+    )
+    manifest = load_manifest(dataset_dir)
+    assert manifest["splits"]["train"]["seeds"] == [700, 701]
+    assert manifest["splits"]["validation"]["seeds"] == [702]
+    train_seen = set()
+    for path in split_shards(dataset_dir, manifest, "train"):
+        shard = load_shard(path)
+        assert set(shard["map_seeds"]) == set(shard["episode_seeds"])
+        train_seen.update(map(int, shard["map_seeds"]))
+    validation_shard = load_shard(split_shards(dataset_dir, manifest, "validation")[0])
+    validation_seen = set(map(int, validation_shard["map_seeds"]))
+    assert train_seen == {700, 701}
+    assert validation_seen == {702}
+    assert train_seen.isdisjoint(validation_seen)
+
+
+def test_offline_dataset_trains_and_validates_without_collecting_new_states(tmp_path):
+    dataset_dir = tmp_path / "dataset"
+    collect_supervised_dataset(
+        Namespace(
+            output=dataset_dir,
+            train_seeds=2,
+            validation_seeds=1,
+            seed_start=800,
+            episodes_per_shard=2,
+            action_repeat=1,
+            rows=6,
+            cols=6,
+            layout="maze",
+            spawn="default",
+            time_limit=1.0 / 24.0,
+        )
+    )
+    output = tmp_path / "checkpoint"
+    checkpoint = train_offline_bc(
+        Namespace(
+            dataset=dataset_dir,
+            output=output,
+            epochs=1,
+            minibatch_size=4,
+            learning_rate=3e-4,
+            fire_weight=6.0,
+            max_grad_norm=0.5,
+            seed=1,
+            device="cpu",
+            resume=None,
+            save_every=1,
+        )
+    )
+    assert checkpoint.is_file()
+    assert "validation_loss" in (output / "offline_log.csv").read_text(encoding="utf-8")

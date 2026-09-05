@@ -77,13 +77,35 @@ conda activate teacher
 cd D:\bysq\tank_rl_sim
 ```
 
-### 1. 模仿寻路开火人机（监督预训练）
+### 1. 固定离线数据与监督预训练
 
-两边都由人机开车，模型只学它的油门、转向、开火。人机会 A* 绕墙，看见敌人就打，有弹就躲。
+两边都由人机开车，模型只学它的油门、转向、开火。新版 hunter 会 A* 绕墙；直射被挡住时会用镜像目标生成反弹候选，再用真实墙体和子弹尺寸完整预演弹道；躲避时会同时预测所有敌我子弹未来 1.25 秒（包含后续反弹），在 9 种油门/转向组合中选安全余量最大的动作。
+
+先固定采集一次数据。一个地图种子的完整对局只会进入一个集合；下面使用 800 张训练地图和后续 200 张验证地图，并按 20 局一个压缩分片保存：
 
 ```powershell
-python -m supervised.train --total-steps 200000 --output checkpoints/hunter_bc
+python -m supervised.collect `
+  --output datasets/hunter_exact_v4 `
+  --seed-start 10000 `
+  --train-seeds 800 `
+  --validation-seeds 200 `
+  --episodes-per-shard 20 `
+  --workers 4
 ```
+
+清单写在 `manifest.json`。如果输出目录已经存在清单，采集器会拒绝混写，必须显式换目录。分片同时保存地图种子、完整对局边界和双方逐步动作，因此以后更换观察编码时可以按相同轨迹重新编码。
+
+然后只读取这份固定数据训练；每轮完整跑一次互不重叠的验证地图：
+
+```powershell
+python -m supervised.train_offline `
+  --dataset datasets/hunter_exact_v4 `
+  --epochs 20 `
+  --fire-weight 6 `
+  --output checkpoints/hunter_bc_exact_v4
+```
+
+模型直接学习18类联合动作；日志仍把油门、转向、开火的边缘 loss/准确率和开火 precision/recall 拆开显示。`supervised.train` 的边采边训方式保留用于旧实验，但不再作为推荐入口。
 
 先看人机本身：
 
@@ -94,7 +116,7 @@ python -m supervised.watch --rows 6 --cols 6
 看克隆模型打人机：
 
 ```powershell
-python -m supervised.evaluate --checkpoint checkpoints/hunter_bc/latest.pt --games 10
+python -m supervised.evaluate --checkpoint checkpoints/hunter_bc_exact_v4/latest.pt --games 200 --no-render
 ```
 
 ### 2. 强化学习
@@ -102,51 +124,51 @@ python -m supervised.evaluate --checkpoint checkpoints/hunter_bc/latest.pt --gam
 监督差不多之后，再继承权重做 PPO。奖励只有胜负、自杀和超时。
 
 ```powershell
-python -m rl.train --opponent hunter --initialize-from checkpoints/hunter_bc/latest.pt --output checkpoints/rl --total-steps 200000
-```
-
-对手池可为每个条目指定权重。下面的例子用当前候选权重初始化新阶段，50% 对最近冻结版本、25% 对 hunter、其余 25% 对更早版本：
-
-```powershell
 python -m rl.train `
-  --initialize-from "checkpoints/RL_对手池2_加入最新/latest.pt" `
-  --opponent hunter "checkpoints/RL_开火归因_对人机/latest.pt" "checkpoints/RL_对手池_人机加自己/latest.pt" "checkpoints/RL_对手池2_加入最新/latest.pt" `
-  --opponent-weights 0.25 0.10 0.15 0.50 `
-  --output "checkpoints/RL_稳定训练1" `
-  --total-steps 500000 --no-plot
+  --opponent hunter `
+  --initialize-from checkpoints/hunter_bc_exact_v4/latest.pt `
+  --teacher-coef 0 `
+  --potential-scale 0.2 `
+  --opponent-self-kill-reward 0 `
+  --output checkpoints/RL_exact_v4_hunter `
+  --total-steps 300000
 ```
 
 默认 PPO 使用 16 个环境、128 步 rollout、512 小批量、`1e-4` 退火学习率和 `0.02` target KL。训练日志会记录每种对手最近 100 局的独立战绩、近似 KL、clip fraction、explained variance 和动作比例。冻结模型对手在训练时按策略概率采样动作，不固定使用 argmax。
 
-如果混合对手池长期只在 50% 附近切换策略，先做固定 hunter 专项训练，不要继续扩大池子：
+第一阶段固定打 hunter。主动击杀稳定提升后，才把该阶段冻结权重加入下一阶段的对手池，例如：
 
 ```powershell
 python -m rl.train `
-  --initialize-from "checkpoints/RL_稳定训练1/latest.pt" `
-  --opponent hunter `
-  --teacher-coef 0.03 `
+  --initialize-from checkpoints/RL_exact_v4_hunter/latest.pt `
+  --opponent hunter checkpoints/RL_exact_v4_hunter/latest.pt `
+  --opponent-weights 0.5 0.5 `
+  --teacher-coef 0 `
   --potential-scale 0.2 `
-  --output "checkpoints/RL_hunter专项" `
+  --opponent-self-kill-reward 0 `
+  --output checkpoints/RL_exact_v4_pool1 `
   --total-steps 300000
 ```
 
-`teacher-coef` 只在智能体实际访问到的状态上加入一个随学习率衰减的 hunter 辅助分类损失，用来保住寻路、躲弹和开火基本功；PPO 仍由胜负决定改进方向。坦克和子弹集合使用零初始化的可学习注意力，加载旧 checkpoint 时初始行为与原来的平均池化一致。
+监督 checkpoint 只负责初始化；推荐 RL 使用 `--teacher-coef 0`，让后续策略完全由胜负目标改进。
 
 观战：
 
 ```powershell
-python -m rl.evaluate --checkpoint checkpoints/rl/latest.pt --opponent hunter --games 10
+python -m rl.evaluate --checkpoint checkpoints/RL_exact_v4_hunter/latest.pt --opponent hunter --games 200 --no-render
 ```
 
 正式比较建议至少打 200 局。默认相邻两局复用同一地图并交换双方位置，结果会给出 95% 置信区间：
 
 ```powershell
-python -m rl.evaluate --checkpoint "checkpoints/RL_稳定训练1/latest.pt" --opponent hunter --games 200 --no-render
+python -m rl.evaluate --checkpoint checkpoints/RL_exact_v4_hunter/latest.pt --opponent hunter --games 200 --seed 8000 --no-render
 ```
 
 `--resume` 继续同一次训练；`--initialize-from` 只拷权重、步数从 0 开始。
 
-每辆坦克的输入包括 `1×48×48` 局部墙图、自身 12 维状态（无绝对坐标），以及其他坦克和子弹两个相对自身的可变长集合。
+每辆坦克输入完整的 `5×12×12` 精确墙拓扑（四向墙和有效区域），支持每局随机的 `6..12` 行列。动态实体不栅格化：最多两个其他坦克和十五颗子弹都保留连续坐标，并按精确位置从墙体 CNN 特征图双线性取样。实体集合用共享 MLP 和 `sum+max` 汇总；策略使用单个18类联合动作头。模型无 A* 路点、墙距射线、注意力和 LSTM，共约11.2万参数。
+
+观察和动作头均已更换，因此所有旧 checkpoint 和旧离线数据都不能与新版混用；监督学习必须重新采集并从随机初始化训练。
 
 PPO 的任务奖励只有一次终局结果：胜利 `+1.0`，失败、自杀和超时均为 `-1.0`，不再按子弹飞行时间跨 rollout 回写多份击杀奖励。训练默认另加 `0.2 × (γΦ(s')-Φ(s))` 的势函数塑形；它由 A* 路径距离和有视线时的瞄准状态构成，折扣累计后只差初始状态常数，不能通过来回靠近刷分。具体参数集中在 `rl/environment.py` 的 `RewardConfig` 中。`checkpoints/` 已被 Git 忽略，不会误提交较大的模型文件。
 
