@@ -175,7 +175,9 @@ def test_one_bullet_hit_immediately_destroys_tank():
     assert not target.alive
     assert game.is_over
     assert game.winner == game.tanks[0].tank_id
-    assert events == [{"shooter": game.tanks[0].tank_id, "victim": target.tank_id}]
+    assert events[0]["shooter"] == game.tanks[0].tank_id
+    assert events[0]["victim"] == target.tank_id
+    assert events[0]["bullet_age"] >= 1.0
 
 
 def test_many_random_updates_remain_finite():

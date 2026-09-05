@@ -10,16 +10,14 @@ from core.geometry import segment_intersects_rect
 from core.maze import Maze
 
 from .observation import Observation, build_observation
-from .planning import astar_path, tank_cell
-
-AIM_DEADZONE = 0.2  # 炮口对准敌人的最大夹角，约 11 度。
+from .planning import Cell, astar_path
 
 LAYOUTS = ("maze", "open")
 SPAWNS = ("default", "close_facing", "far_random")
 
 
 def make_open_maze(rows: int, cols: int) -> Maze:
-    """只保留外墙的空场，第三关默认不用，仅 layout=open 时使用。"""
+    """只保留外墙的空场。"""
     horizontal = np.zeros((rows + 1, cols), dtype=np.bool_)
     vertical = np.zeros((rows, cols + 1), dtype=np.bool_)
     horizontal[0] = True
@@ -31,15 +29,14 @@ def make_open_maze(rows: int, cols: int) -> Maze:
 
 @dataclass
 class RewardConfig:
-    """局结束胜负，加上 A* 靠近和瞄准开火。"""
+    """终局胜负，以及不会改变最优策略的势函数塑形。"""
 
-    win: float = 2.0  # 最终存活并获胜。
+    win: float = 1.0  # 最终存活并获胜。
     loss: float = -1.0  # 被敌人击毁。
-    self_kill: float = -0.5  # 被自己的子弹击毁。
+    self_kill: float = -1.0  # 被自己的子弹击毁。
     timeout: float = -1.0  # 超时双方惩罚。
-    path_progress: float = 0.08  # A* 路径连续距离每缩短 1 格的奖励；走远对称扣分。
-    aim: float = 0.002  # 炮口对准且中间没墙时，每决策步给一点瞄准奖。
-    aim_fire: float = 0.08  # 在上述条件下真正开出一炮。
+    potential_scale: float = 0.0  # 训练时建议 0.2；评估环境保持 0。
+    potential_gamma: float = 0.995  # 必须与 PPO 的决策步 gamma 一致。
 
 
 class TankSelfPlayEnv:
@@ -70,7 +67,7 @@ class TankSelfPlayEnv:
         self.game = TankGame(rows=rows, cols=cols, time_limit=time_limit)
         self.reward_config = reward_config if reward_config is not None else RewardConfig()
         self.agent_ids = tuple(tank.tank_id for tank in self.game.tanks)
-        self._path_distance = np.zeros(self.num_agents, dtype=np.float32)
+        self._potential = np.zeros(self.num_agents, dtype=np.float32)
 
     def reset(self, seed: int | None = None) -> list[Observation]:
         """开始新对局并返回两辆坦克各自视角的观察。"""
@@ -80,9 +77,7 @@ class TankSelfPlayEnv:
             self.game.wall_rects = self.game.maze.wall_rects(self.game.wall_thickness)
         self._place_tanks()
         self.agent_ids = tuple(tank.tank_id for tank in self.game.tanks)
-        self._path_distance = np.array(
-            [self._enemy_path_distance(tank) for tank in self.game.tanks], dtype=np.float32
-        )
+        self._potential[:] = self._state_potential()
         return self._observations()
 
     def _place_tanks(self) -> None:
@@ -116,25 +111,16 @@ class TankSelfPlayEnv:
             raise ValueError(f"actions must have shape ({self.num_agents}, 3)")
         rewards = np.zeros(self.num_agents, dtype=np.float32)
         config = self.reward_config
+        previous_potential = self._potential.copy()
         all_events: list[dict[str, int]] = []
         frames_executed = 0
 
         for _ in range(self.action_repeat):
             if self.game.is_over:
                 break
-            existing_bullets = {id(bullet) for bullet in self.game.bullets}
             events = self.game.update([tuple(map(int, action)) for action in action_array])
             all_events.extend(events)
             frames_executed += 1
-            for bullet in self.game.bullets:
-                if id(bullet) in existing_bullets:
-                    continue
-                owner_index = self.agent_ids.index(bullet.owner_tank_id)
-                if self._aimed_at_enemy(self.game.tanks[owner_index]):
-                    rewards[owner_index] += config.aim_fire
-
-        self._apply_path_progress(rewards)
-        self._apply_aim_reward(rewards)
 
         if self.game.is_over:
             death_shooter = {event["victim"]: event["shooter"] for event in all_events}
@@ -152,6 +138,12 @@ class TankSelfPlayEnv:
                         rewards[index] += config.self_kill
                     else:
                         rewards[index] += config.loss
+        next_potential = np.zeros(self.num_agents, dtype=np.float32) if self.game.is_over else self._state_potential()
+        if config.potential_scale != 0.0:
+            rewards += config.potential_scale * (
+                config.potential_gamma * next_potential - previous_potential
+            )
+        self._potential[:] = next_potential
         info: dict[str, object] = {
             "events": all_events,
             "winner": self.game.winner,
@@ -166,57 +158,46 @@ class TankSelfPlayEnv:
                 return other
         return None
 
-    def _enemy_path_distance(self, tank) -> float:
-        """沿 A* 折线到敌人的连续世界距离，从坦克中心算起。"""
-        enemy = self._alive_enemy(tank)
-        if enemy is None or not tank.alive:
-            return 0.0
-        path = astar_path(self.game.maze, tank_cell(tank, self.game.maze), tank_cell(enemy, self.game.maze))
+    def _cell_of(self, x: float, y: float) -> Cell:
+        """把世界坐标限制并转换为迷宫格。"""
+        maze = self.game.maze
+        row = int(np.clip(math.floor(y), 0, maze.rows - 1))
+        col = int(np.clip(math.floor(x), 0, maze.cols - 1))
+        return row, col
+
+    def _path_distance_xy(self, x0: float, y0: float, x1: float, y1: float) -> float:
+        """沿 A* 折线从一点到另一点的连续世界距离。"""
+        path = astar_path(self.game.maze, self._cell_of(x0, y0), self._cell_of(x1, y1))
         if len(path) <= 1:
-            return math.hypot(enemy.x - tank.x, enemy.y - tank.y)
+            return math.hypot(x1 - x0, y1 - y0)
         points = [(col + 0.5, row + 0.5) for row, col in path[1:]]
-        points.append((enemy.x, enemy.y))
+        points.append((x1, y1))
         total = 0.0
-        prev_x, prev_y = tank.x, tank.y
+        prev_x, prev_y = x0, y0
         for x, y in points:
             total += math.hypot(x - prev_x, y - prev_y)
             prev_x, prev_y = x, y
         return total
 
-    def _has_line_of_sight(self, tank, enemy) -> bool:
-        """坦克中心到敌人中心是否被墙挡住。"""
-        for wall in self.game.wall_rects:
-            if segment_intersects_rect(tank.x, tank.y, enemy.x, enemy.y, wall):
-                return False
-        return True
-
-    def _aimed_at_enemy(self, tank) -> bool:
-        """炮口对准敌人，并且中间没有墙。"""
-        enemy = self._alive_enemy(tank)
-        if enemy is None or not tank.alive:
-            return False
-        bearing = math.atan2(enemy.y - tank.y, enemy.x - tank.x)
-        offset = (bearing - tank.heading + math.pi) % (2 * math.pi) - math.pi
-        if abs(offset) > AIM_DEADZONE:
-            return False
-        return self._has_line_of_sight(tank, enemy)
-
-    def _apply_path_progress(self, rewards: np.ndarray) -> None:
-        """按 A* 连续距离变化给绕墙靠近奖励。"""
+    def _state_potential(self) -> np.ndarray:
+        """用路径距离和可射击朝向描述局势；只通过 gamma*Phi(s')-Phi(s) 进入奖励。"""
+        result = np.zeros(self.num_agents, dtype=np.float32)
+        distance_scale = max(float(self.game.maze.rows + self.game.maze.cols), 1.0)
         for index, tank in enumerate(self.game.tanks):
-            if not tank.alive:
-                self._path_distance[index] = 0.0
+            enemy = self._alive_enemy(tank)
+            if not tank.alive or enemy is None:
                 continue
-            new_distance = self._enemy_path_distance(tank)
-            delta = self._path_distance[index] - new_distance
-            rewards[index] += self.reward_config.path_progress * float(delta)
-            self._path_distance[index] = new_distance
-
-    def _apply_aim_reward(self, rewards: np.ndarray) -> None:
-        """中间没墙且炮口对准时，每步给瞄准奖。"""
-        for index, tank in enumerate(self.game.tanks):
-            if tank.alive and self._aimed_at_enemy(tank):
-                rewards[index] += self.reward_config.aim
+            distance = self._path_distance_xy(tank.x, tank.y, enemy.x, enemy.y)
+            navigation = -min(distance / distance_scale, 1.0)
+            has_los = not any(
+                segment_intersects_rect(tank.x, tank.y, enemy.x, enemy.y, wall)
+                for wall in self.game.wall_rects
+            )
+            target_heading = math.atan2(enemy.y - tank.y, enemy.x - tank.x)
+            heading_error = (target_heading - tank.heading + math.pi) % (2.0 * math.pi) - math.pi
+            aim = max(0.0, math.cos(heading_error)) if has_los else 0.0
+            result[index] = 0.7 * navigation + 0.3 * aim
+        return result
 
     def _observations(self) -> list[Observation]:
         """按稳定的智能体编号顺序构造当前观察。"""

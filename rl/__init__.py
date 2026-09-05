@@ -1,4 +1,4 @@
-"""第三关：随机迷宫，观察和奖励与第一关同一套。"""
+"""强化学习包：迷宫对战，观察与人机脚本共用。"""
 
 from .environment import TankSelfPlayEnv
 from .observation import MAP_CHANNELS, MAP_SIZE, build_observation

@@ -14,7 +14,7 @@ class TrainingPlot:
         self.fig, self.axes = plt.subplots(3, 1, sharex=True, figsize=(8, 7))
         manager = getattr(self.fig.canvas, "manager", None)
         if manager is not None:
-            manager.set_window_title("stage3 training")
+            manager.set_window_title("RL training")
         self.steps: list[int] = []
         self.returns: list[float] = []
         self.wins: list[float] = []

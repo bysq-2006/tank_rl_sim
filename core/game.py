@@ -64,14 +64,14 @@ class TankGame:
         self.is_over = False
         self.winner = None
 
-    def update(self, controls: list[Any] | tuple[Any, ...]) -> list[dict[str, int]]:
+    def update(self, controls: list[Any] | tuple[Any, ...]) -> list[dict[str, Any]]:
         """根据外部提供的全部坦克控制，让游戏世界前进一个固定物理帧。"""
         if self.is_over:
             return []
         if len(controls) != len(self.tanks):
             raise ValueError(f"expected {len(self.tanks)} tank controls, got {len(controls)}")
         parsed_controls = [self._parse_control(control) for control in controls]  # 本帧全部坦克的外部控制。
-        events: list[dict[str, int]] = []  # 本帧命中记录，包含发射方和受击方。
+        events: list[dict[str, Any]] = []  # 本帧命中记录，包含发射方、受击方和子弹飞行时间。
         self._physics_tick(parsed_controls, events)
         self.elapsed += self.dt
         self._update_game_result()
@@ -98,7 +98,7 @@ class TankGame:
             self.is_over = True
             self.winner = None
 
-    def _physics_tick(self, controls: list[Control], events: list[dict[str, int]]) -> None:
+    def _physics_tick(self, controls: list[Control], events: list[dict[str, Any]]) -> None:
         """执行一帧完整物理：先更新坦克，再更新子弹。"""
         for tank, (throttle, steer, fire) in zip(self.tanks, controls):
             if not tank.alive:
@@ -131,7 +131,13 @@ class TankGame:
             hit = self._bullet_hit(bullet)
             if hit is not None:
                 hit.alive = False
-                events.append({"shooter": bullet.owner_tank_id, "victim": hit.tank_id})
+                events.append(
+                    {
+                        "shooter": bullet.owner_tank_id,
+                        "victim": hit.tank_id,
+                        "bullet_age": float(bullet.age),
+                    }
+                )
                 self.bullets.remove(bullet)
             elif bullet.age >= self.bullet_lifetime or bullet.bounces > self.max_bounces:
                 self.bullets.remove(bullet)

@@ -1,26 +1,20 @@
 import math
 
 import numpy as np
-import pytest
 import torch
 
 from core import TankGame
 from core.entities import Bullet
-from rl_stage3.environment import RewardConfig, TankSelfPlayEnv
-from rl_stage3.model import TankActorCritic
-from rl_stage3.observation import BULLET_FEATURES, MAP_CHANNELS, MAP_SIZE, MAX_BULLETS, MAX_OTHER_TANKS, SELF_FEATURES, TANK_FEATURES, build_observation
-from rl_stage3.planning import astar_distance, tank_cell
-from rl_stage3.trajectory import proximity_score, trace_bullet_trajectory
-
-try:
-    from supervised.teachers import AStarDrivingTeacher, WeakCombatTeacher
-except ImportError:
-    AStarDrivingTeacher = None
-    WeakCombatTeacher = None
+from rl.environment import RewardConfig, TankSelfPlayEnv
+from rl.model import TankActorCritic, load_actor_critic_state
+from rl.observation import BULLET_FEATURES, MAP_CHANNELS, MAP_SIZE, MAX_BULLETS, MAX_OTHER_TANKS, SELF_FEATURES, TANK_FEATURES, build_observation
+from rl.planning import astar_distance, tank_cell
+from rl.trajectory import proximity_score, trace_bullet_trajectory
+from supervised.teachers import HunterTeacher
 
 
 def make_open_arena(game: TankGame, rows: int = 6, cols: int = 6) -> None:
-    from rl_stage3.environment import make_open_maze
+    from rl.environment import make_open_maze
 
     game.maze = make_open_maze(rows, cols)
     game.wall_rects = game.maze.wall_rects(game.wall_thickness)
@@ -75,6 +69,34 @@ def test_environment_advances_repeated_physics_frames():
     assert info["frames_executed"] == 2
 
 
+def test_disabled_path_progress_does_not_shape_movement():
+    env = TankSelfPlayEnv(action_repeat=1, layout="open", spawn="close_facing")
+    env.reset(seed=3)
+    idle = 0.0
+    for _ in range(12):
+        _, rewards, _, _ = env.step([(1, 1, 0), (2, 1, 0)])
+        idle += float(rewards[0])
+    env.reset(seed=3)
+    approaching = 0.0
+    for _ in range(12):
+        _, rewards, _, _ = env.step([(2, 1, 0), (1, 1, 0)])
+        approaching += float(rewards[0])
+    assert approaching == idle == 0.0
+
+
+def test_potential_shaping_rewards_useful_state_progress():
+    env = TankSelfPlayEnv(
+        action_repeat=1,
+        layout="open",
+        spawn="close_facing",
+        reward_config=RewardConfig(potential_scale=1.0, potential_gamma=1.0),
+    )
+    env.reset(seed=3)
+    _, rewards, done, _ = env.step([(2, 1, 0), (1, 1, 0)])
+    assert done is False
+    assert rewards[0] > 0.0
+
+
 def test_survivor_wins_even_when_enemy_destroys_itself():
     env = TankSelfPlayEnv(action_repeat=1)
     env.reset(seed=4)
@@ -83,7 +105,7 @@ def test_survivor_wins_even_when_enemy_destroys_itself():
     assert done is True
     assert info["winner"] == 1
     assert np.isclose(rewards[0], RewardConfig().loss)
-    assert rewards[1] >= RewardConfig().win - 1e-5
+    assert np.isclose(rewards[1], RewardConfig().win)
 
 
 def test_own_bullet_kill_uses_small_self_kill_penalty():
@@ -95,7 +117,7 @@ def test_own_bullet_kill_uses_small_self_kill_penalty():
     assert done is True
     assert info["winner"] == 1
     assert np.isclose(rewards[0], RewardConfig().self_kill)
-    assert rewards[1] >= RewardConfig().win - 1e-5
+    assert np.isclose(rewards[1], RewardConfig().win)
 
 
 def test_timeout_is_worse_than_waiting_without_terminal_result():
@@ -123,7 +145,7 @@ def test_open_far_spawn_places_tanks_apart():
 
 
 def test_aim_script_stops_and_fires_when_facing_enemy():
-    from rl_stage1.opponents import script_action
+    from rl.opponents import script_action
 
     env = TankSelfPlayEnv(layout="open", spawn="close_facing", rows=6, cols=6)
     env.reset(seed=11)
@@ -136,8 +158,42 @@ def test_aim_script_stops_and_fires_when_facing_enemy():
     assert fire == 1
 
 
+def test_hunter_fires_when_facing_with_line_of_sight():
+    from rl.opponents import script_action
+
+    env = TankSelfPlayEnv(layout="open", spawn="close_facing", rows=6, cols=6)
+    env.reset(seed=11)
+    first, second = env.game.tanks
+    first.x, first.y, first.heading = 2.0, 3.0, 0.0
+    second.x, second.y = 4.0, 3.0
+    _throttle, steer, fire = script_action(env.game, first.tank_id, "hunter", np.random.default_rng(0))
+    assert steer == 1
+    assert fire == 1
+
+
+def test_opponent_pool_samples_listed_scripts():
+    from rl.opponents import build_opponent_controller
+
+    opponent = build_opponent_controller(["idle", "move"], None, torch.device("cpu"), seed=0)
+    assert opponent is not None
+    names = {opponent.reset_env(0) for _ in range(40)}
+    assert names <= {"idle", "move"}
+    assert len(names) == 2
+
+
+def test_opponent_pool_respects_explicit_weights():
+    from rl.opponents import build_opponent_controller
+
+    opponent = build_opponent_controller(
+        ["idle", "move"], None, torch.device("cpu"), seed=0, weights=[1.0, 0.0]
+    )
+    assert opponent is not None
+    assert {opponent.reset_env(0) for _ in range(20)} == {"idle"}
+    assert opponent.current_label(0) == "idle"
+
+
 def test_idle_script_never_moves_or_fires():
-    from rl_stage1.opponents import script_action
+    from rl.opponents import script_action
 
     env = TankSelfPlayEnv(layout="open", spawn="close_facing", rows=6, cols=6)
     env.reset(seed=11)
@@ -145,7 +201,7 @@ def test_idle_script_never_moves_or_fires():
 
 
 def test_move_script_never_fires():
-    from rl_stage1.opponents import script_action
+    from rl.opponents import script_action
 
     env = TankSelfPlayEnv(layout="open", spawn="close_facing", rows=6, cols=6)
     env.reset(seed=11)
@@ -163,41 +219,18 @@ def test_shortest_path_distance_is_symmetric():
     assert astar_distance(env.game.maze, first, second) == astar_distance(env.game.maze, second, first)
 
 
-@pytest.mark.skipif(AStarDrivingTeacher is None, reason="supervised teachers are not in this workspace")
-def test_astar_teacher_moves_forward_when_aligned():
-    game = TankGame(rows=6, cols=6)
-    make_open_arena(game)
-    own, enemy = game.tanks
-    own.x, own.y, own.heading = 1.5, 3.5, 0.0
-    enemy.x, enemy.y = 4.5, 3.5
-    assert AStarDrivingTeacher().action(game, own.tank_id) == (2, 1, 0)
-
-
-@pytest.mark.skipif(AStarDrivingTeacher is None, reason="supervised teachers are not in this workspace")
-def test_astar_teacher_turns_in_place_instead_of_reversing():
-    game = TankGame(rows=6, cols=6)
-    make_open_arena(game)
-    own, enemy = game.tanks
-    own.x, own.y, own.heading = 1.5, 3.5, math.pi
-    enemy.x, enemy.y = 4.5, 3.5
-    throttle, steer, fire = AStarDrivingTeacher().action(game, own.tank_id)
-    assert throttle == 1
-    assert steer in (0, 2)
-    assert fire == 0
-
-
-@pytest.mark.skipif(WeakCombatTeacher is None, reason="supervised teachers are not in this workspace")
-def test_weak_combat_teacher_fires_when_enemy_is_directly_ahead():
+def test_hunter_teacher_fires_when_enemy_is_directly_ahead():
     game = TankGame(rows=6, cols=6)
     make_open_arena(game)
     own, enemy = game.tanks
     own.x, own.y, own.heading = 1.0, 3.0, 0.0
     enemy.x, enemy.y = 5.0, 3.0
-    assert WeakCombatTeacher().action(game, own.tank_id) == (1, 1, 1)
+    _throttle, steer, fire = HunterTeacher().action(game, own.tank_id)
+    assert steer == 1
+    assert fire == 1
 
 
-@pytest.mark.skipif(WeakCombatTeacher is None, reason="supervised teachers are not in this workspace")
-def test_weak_combat_teacher_does_not_fire_through_blocking_wall():
+def test_hunter_teacher_does_not_fire_through_blocking_wall():
     game = TankGame(rows=6, cols=6)
     make_open_arena(game)
     game.maze.vertical[3, 3] = True
@@ -205,20 +238,7 @@ def test_weak_combat_teacher_does_not_fire_through_blocking_wall():
     own, enemy = game.tanks
     own.x, own.y, own.heading = 1.5, 3.5, 0.0
     enemy.x, enemy.y = 4.5, 3.5
-    _, _, fire = WeakCombatTeacher().action(game, own.tank_id)
-    assert fire == 0
-
-
-@pytest.mark.skipif(WeakCombatTeacher is None, reason="supervised teachers are not in this workspace")
-def test_weak_combat_teacher_stops_and_turns_when_line_of_sight_is_clear():
-    game = TankGame(rows=6, cols=6)
-    make_open_arena(game)
-    own, enemy = game.tanks
-    own.x, own.y, own.heading = 1.0, 3.0, math.pi / 2
-    enemy.x, enemy.y = 5.0, 3.0
-    throttle, steer, fire = WeakCombatTeacher().action(game, own.tank_id)
-    assert throttle == 1
-    assert steer in (0, 2)
+    _, _, fire = HunterTeacher().action(game, own.tank_id)
     assert fire == 0
 
 
@@ -258,12 +278,12 @@ def test_environment_rejects_wrong_action_shape():
 
 def test_model_outputs_three_valid_actions_and_values():
     model = TankActorCritic()
-    maps = torch.zeros((2, MAP_CHANNELS, MAP_SIZE, MAP_SIZE))
-    selves = torch.zeros((2, SELF_FEATURES))
-    tanks = torch.zeros((2, MAX_OTHER_TANKS, TANK_FEATURES))
-    tank_mask = torch.zeros((2, MAX_OTHER_TANKS))
-    bullets = torch.zeros((2, MAX_BULLETS, BULLET_FEATURES))
-    bullet_mask = torch.zeros((2, MAX_BULLETS))
+    maps = torch.randn((2, MAP_CHANNELS, MAP_SIZE, MAP_SIZE))
+    selves = torch.randn((2, SELF_FEATURES))
+    tanks = torch.randn((2, MAX_OTHER_TANKS, TANK_FEATURES))
+    tank_mask = torch.ones((2, MAX_OTHER_TANKS))
+    bullets = torch.randn((2, MAX_BULLETS, BULLET_FEATURES))
+    bullet_mask = torch.ones((2, MAX_BULLETS))
     actions, log_probability, entropy, value = model.get_action_and_value(
         maps, selves, tanks, tank_mask, bullets, bullet_mask
     )
@@ -274,3 +294,16 @@ def test_model_outputs_three_valid_actions_and_values():
     assert torch.all((0 <= actions[:, 0]) & (actions[:, 0] <= 2))
     assert torch.all((0 <= actions[:, 1]) & (actions[:, 1] <= 2))
     assert torch.all((0 <= actions[:, 2]) & (actions[:, 2] <= 1))
+
+
+def test_old_mean_pooling_checkpoint_initializes_attention_as_uniform():
+    source = TankActorCritic()
+    old_state = {
+        key: value
+        for key, value in source.state_dict().items()
+        if not key.startswith(("tank_attention.", "bullet_attention."))
+    }
+    restored = TankActorCritic()
+    load_actor_critic_state(restored, old_state)
+    assert torch.count_nonzero(restored.tank_attention.weight) == 0
+    assert torch.count_nonzero(restored.bullet_attention.weight) == 0
