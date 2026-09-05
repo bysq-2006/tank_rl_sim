@@ -41,6 +41,7 @@ class TankGame:
         self.maze: Maze  # 当前局使用的迷宫。
         self.tanks: list[Tank] = []  # 当前局中的全部坦克。
         self.bullets: list[Bullet] = []  # 当前仍在飞行的全部子弹。
+        self.shots_fired_by_tank: dict[int, int] = {}  # 每辆坦克本局实际成功生成的子弹数。
         self.wall_rects: list[tuple[float, float, float, float]] = []  # 用于碰撞检测的墙矩形。
         self.elapsed = 0.0  # 当前局已经推进的游戏时间。
         self.death_grace = 3.4  # 首辆坦克死亡后，再等待这么多秒才结束对局。
@@ -64,6 +65,7 @@ class TankGame:
             Tank(far[1] + 0.5, far[0] + 0.5, float(self.rng.uniform(-math.pi, math.pi)), tank_id=1),
         ]
         self.bullets = []
+        self.shots_fired_by_tank = {tank.tank_id: 0 for tank in self.tanks}
         self.elapsed = 0.0
         self.first_death_at = None
         self.is_over = False
@@ -247,6 +249,7 @@ class TankGame:
             y = tank.y + uy * (self.tank_half_length - self.bullet_radius)
             vx, vy, bounces = -vx, -vy, 1
         self.bullets.append(Bullet(x, y, vx, vy, owner_tank_id=tank.tank_id, bounces=bounces))
+        self.shots_fired_by_tank[tank.tank_id] = self.shots_fired_by_tank.get(tank.tank_id, 0) + 1
         # 使用累加而不是覆盖，以保留固定帧更新产生的少量超时误差。
         tank.cooldown += self.fire_cooldown
 
